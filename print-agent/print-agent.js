@@ -31,7 +31,8 @@ const { ThermalPrinter, PrinterTypes } = require('node-thermal-printer');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const LOG_PATH = path.join(__dirname, 'print-agent.log');
 const WINPRINT_HELPER_PATH = path.join(__dirname, 'winprint-helper.ps1');
-const TEST_MODE = process.env.TEST_MODE === '1'; // não manda pra impressora de verdade, só mostra no log/console
+const TEST_MODE = process.env.TEST_MODE === '1';
+const PENDING_POLL_MS = 15000; // não manda pra impressora de verdade, só mostra no log/console
 
 if (!fs.existsSync(CONFIG_PATH)) {
   console.error('❌ Não encontrei config.json. Copie config.example.json pra config.json e preencha os dados antes de rodar.');
@@ -84,7 +85,15 @@ function loadPrinters() {
       label: p.label || p.stations?.join(', ') || 'Impressora',
       type: p.type === 'star' ? PrinterTypes.STAR : PrinterTypes.EPSON,
       interface: p.interface,
-      width: p.width || 42,
+      // v126 — BUG CORRIGIDO ("ajuste pra caber na bobina 80mm bematech"): o padrão de
+      // fábrica era 42 colunas — nem o valor certo pra 58mm (32) nem pra 80mm (48), então
+      // QUALQUER impressora nova (58mm ou 80mm) que ninguém tivesse configurado explicitamente
+      // com "width" no config.json saía com colunas erradas pros dois casos. Ficha técnica de
+      // 80mm Bematech em modo ESC/POS (fonte A, padrão de fábrica) é 48 colunas — mesmo valor
+      // já usado no lado do servidor pra impressão direta (ver printCols() em server.js) —
+      // então 48 vira o novo padrão daqui também, mantendo os dois lados consistentes. Quem
+      // usa 58mm continua podendo sobrescrever com "width": 32 no config.json normalmente.
+      width: p.width || 48,
       stations: Array.isArray(p.stations) && p.stations.length ? p.stations : ['caixa']
     }));
   }
@@ -93,7 +102,7 @@ function loadPrinters() {
     label: 'Impressora principal',
     type: cfg.printerType === 'star' ? PrinterTypes.STAR : PrinterTypes.EPSON,
     interface: cfg.printerInterface,
-    width: cfg.printerWidth || 42,
+    width: cfg.printerWidth || 48, // v126 — mesmo ajuste acima (era 42, virou 48 = padrão 80mm)
     stations: Array.isArray(cfg.stations) && cfg.stations.length ? cfg.stations : ['caixa']
   }];
 }
@@ -193,7 +202,18 @@ function payMethodTicketLabel(order) {
 // v55: quais vias esse agente é responsável por imprimir — agora é a UNIÃO das vias de
 // TODAS as impressoras configuradas acima (antes era uma lista solta em cfg.stations).
 const MY_STATIONS = [...new Set(PRINTERS.flatMap(p => p.stations))];
-const STATION_LABELS = { caixa: 'Caixa', cozinha: 'Cozinha', sushibar: 'Sushibar', bar: 'Bar' };
+// v129 — NOVO: rótulos das duas vias que faltavam aqui (delivery/expedição já existem como
+// estação padrão do sistema desde a v46, mas essa lista hardcoded no Agente nunca foi
+// atualizada — sem entrada aqui, essas duas vias apareciam sem nome bonito nos logs/ticket).
+const STATION_LABELS = { caixa: 'Caixa', cozinha: 'Cozinha', sushibar: 'Sushibar', bar: 'Bar', delivery: 'Delivery', expedicao: 'Expedição' };
+// v129 — NOVO ("via do motoboy/expedição deve focar em cliente/endereço/pagamento, não na
+// lista de itens"): o Agente Local não tem acesso ao cfg.stations[x].kind do servidor (ele só
+// enxerga config.json PRÓPRIO, de impressora — ver loadPrinters() acima), então usa a mesma
+// convenção de nome fixo que o servidor usa como padrão de fábrica (ver DEFAULT_CFG.stations
+// em server.js). Cobre o caso de longe mais comum (as duas vias de despacho padrão do
+// sistema); uma via de despacho CUSTOMIZADA com outro nome continuaria saindo como produção
+// aqui — mesma limitação que STATION_LABELS acima já tinha pra nomes fora da lista.
+const DISPATCH_STATIONS = ['delivery', 'expedicao'];
 
 // v92 — mesma correção de tamanho de fonte feita no server.js (impressora de rede/USB direta),
 // agora espelhada aqui pro Agente Local (que usa node-thermal-printer): antes o tamanho
@@ -212,52 +232,152 @@ function tamanhoImpressaoTermica(printSize) {
 // DA <SETOR>" + espaço de observações nas vias de produção (cozinha/sushibar/bar).
 function printStationTicket(printer, order, station, storeName) {
   const isCaixa = station === 'caixa';
-  const items = isCaixa ? (order.items || []) : (order.items || []).filter(i => (i.stations || []).includes(station));
-  if (!items.length) return false; // essa via não tem nada desse pedido — não desperdiça papel
+  const isDispatch = !isCaixa && DISPATCH_STATIONS.includes(station);
+  const items = (isCaixa || isDispatch) ? (order.items || []) : (order.items || []).filter(i => (i.stations || []).includes(station));
+  // v129: despacho só imprime pra pedido DELIVERY (retirada não tem motoboy pra avisar) —
+  // não depende de item nenhum ter essa via marcada (ninguém marca comida como "via delivery").
+  if (isDispatch && order.mode !== 'delivery') return false;
+  if (!isDispatch && !items.length) return false; // essa via não tem nada desse pedido — não desperdiça papel
 
   const tam = tamanhoImpressaoTermica(order._printFontSize);
+  // v131 — NOVO VISUAL DO COMPROVANTE (só formatação — nenhuma lógica de fila, claim,
+  // anti-duplicação, corte, bipe ou comunicação com a impressora foi tocada aqui): cabeçalho
+  // emoldurado por linha dupla em cima E embaixo, e "PEDIDO #" vira o elemento mais destacado
+  // do ticket inteiro (pedido explícito do novo layout "premium minimalista").
   printer.alignCenter();
+  printer.drawLine('=');
   printer.bold(true); printer.setTextDoubleHeight();
   printer.println((storeName || 'SHOGATSU').toUpperCase());
   printer.setTextNormal(); printer.bold(false);
-  printer.println('CULINARIA ORIENTAL');
-  printer.drawLine();
+  // v133 — BUG CORRIGIDO ("cabeçalho deve ter apenas Shogatsu Culinária Oriental"): a linha
+  // fixa "CULINARIA ORIENTAL" abaixo do nome da loja ficava redundante quando o nome já
+  // configurado (storeName) é algo como "Shogatsu Culinária Oriental" — mesma correção feita
+  // no server.js. Cabeçalho mostra só o nome da loja, uma vez.
+  printer.drawLine('=');
+  printer.newLine();
+  printer.bold(true); printer.setTextSize(tam.h, Math.min(tam.w + 1, 5));
+  printer.println(order.ticketNumber ? `PEDIDO Nº ${order.ticketNumber}` : `PEDIDO #${order.id}`);
+  printer.setTextSize(tam.h, tam.w); printer.bold(false);
+  printer.newLine();
   printer.setTextSize(tam.h, tam.w); // a partir daqui, o corpo do ticket já respeita o tamanho configurado
 
   if (isCaixa) {
-    printer.println('COMPROVANTE');
-
+    // v131 — NOVO VISUAL (mesmo dado, só reorganizado por seção: DATA/HORA/TIPO, ITENS,
+    // OBSERVAÇÃO, CLIENTE/TELEFONE/ENDEREÇO, PAGAMENTO+TOTAL — igual ao layout novo do
+    // server.js, pra ficar igual não importa qual caminho de impressão a loja usa).
+    // v131 — BUG CORRIGIDO ("tempo de entrega deve ser o que está definido no sistema"): o
+    // Agente Local nunca mostrava a previsão de entrega/retirada no comprovante — o valor
+    // calculado a partir do que está configurado em Configurações (cfg.time/cfg.timeRetirada)
+    // só chegava pro navegador e pra impressão direta do servidor, nunca pro Agente Local. O
+    // servidor agora manda esse valor pronto (order._deliveryWindow, calculado com a MESMA
+    // configuração) tanto no pedido novo em tempo real quanto na fila de recuperação.
     printer.alignLeft();
-    printer.println(order.ticketNumber ? `Pedido Nº ${order.ticketNumber}` : `Pedido #${order.id}`);
-    printer.println(`Hora: ${new Date(order.createdAt).toLocaleString('pt-BR')}`);
-    printer.println(order.mode === 'delivery' ? 'ENTREGA (DELIVERY)' : 'RETIRADA');
+    printer.drawLine();
+    printer.println('DATA: ' + new Date(order.createdAt).toLocaleDateString('pt-BR'));
+    printer.println('HORA: ' + new Date(order.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
+    printer.println('TIPO: ' + (order.mode === 'delivery' ? 'DELIVERY' : 'RETIRADA'));
+    printer.drawLine();
+    printer.newLine();
+    items.forEach(it => {
+      printer.print(`${it.qty}x  `);
+      printer.bold(true); printer.setTextSize(tam.h, Math.min(tam.w + 1, 5));
+      printer.println(it.name);
+      printer.bold(false); printer.setTextSize(tam.h, tam.w);
+    });
+    printer.drawLine();
+    if (order.obs) {
+      printer.newLine();
+      printer.bold(true); printer.println('OBSERVACAO'); printer.bold(false);
+      printer.println(order.obs);
+      printer.drawLine();
+    }
+    if (order.scheduledFor) { printer.println('Agendado: ' + new Date(order.scheduledFor).toLocaleString('pt-BR')); printer.drawLine(); }
+    printer.newLine();
+    printer.bold(true); printer.println('CLIENTE'); printer.bold(false);
+    printer.println(order.name || '-');
+    printer.newLine();
+    printer.bold(true); printer.println('TELEFONE'); printer.bold(false);
+    if (order.phone) printer.println(order.phone);
+    if (order.mode === 'delivery' && order.address) {
+      printer.newLine();
+      printer.bold(true); printer.println('ENDERECO'); printer.bold(false);
+      printer.println(order.address);
+    }
+    printer.println((order.mode === 'delivery' ? 'Previsao: ' : 'Previsao retirada: ') + (order._deliveryWindow || '—'));
+    printer.drawLine();
+    printer.newLine();
+    printer.bold(true); printer.println('PAGAMENTO'); printer.bold(false);
+    printer.println(`${payMethodTicketLabel(order)}${order.paid ? ' (PAGO)' : ''}${order.troco ? ' (troco para ' + order.troco + ')' : ''}`);
+    printer.newLine();
+    printer.leftRight('Subtotal', money(order.subtotal));
+    printer.leftRight('Entrega', money(order.fee));
+    if (order.discount > 0 || order.couponCode) printer.leftRight(`Cupom ${order.couponCode || ''}`, '-' + money(order.discount || 0));
+    printer.newLine();
+    printer.bold(true); printer.println('TOTAL'); printer.bold(false);
+    printer.bold(true); printer.setTextSize(tam.h, Math.min(tam.w + 1, 5));
+    printer.println(money(order.total));
+    printer.setTextSize(tam.h, tam.w); printer.bold(false);
+    printer.alignCenter();
+    printer.drawLine('=');
+    printer.newLine();
+    // v133 — BUG CORRIGIDO ("rodapé deve ter apenas Obrigado pela Preferência"): antes
+    // repetia "OBRIGADO!" + o nome da loja de novo (redundante). Volta pra uma linha só.
+    printer.bold(true); printer.println('OBRIGADO PELA PREFERENCIA!'); printer.bold(false);
+    printer.drawLine('=');
+    printer.alignLeft();
+  } else if (isDispatch) {
+    // v129 — NOVO ("via do motoboy/expedição deve focar em cliente/endereço/pagamento, não
+    // na lista de itens como cozinha/sushibar"): mesmo bloco de dados de entrega do Caixa,
+    // sem lista de itens — quem sai pra entregar só precisa saber pra onde ir e quanto cobrar.
+    printer.println((STATION_LABELS[station] || station).toUpperCase());
+    printer.println('VIA DE DESPACHO');
+    printer.alignLeft();
+    printer.println(`Ref.: #${String(order.id).slice(-11).toUpperCase()}`);
     printer.drawLine();
     printer.bold(true); printer.println('CLIENTE'); printer.bold(false);
     printer.drawLine();
     printer.println(order.name || '-');
     if (order.phone) printer.println('Tel: ' + order.phone);
-    if (order.mode === 'delivery' && order.address) printer.println('End: ' + order.address);
-    if (order.scheduledFor) printer.println('Agendado: ' + new Date(order.scheduledFor).toLocaleString('pt-BR'));
     printer.drawLine();
-    printer.bold(true); printer.println('ITENS'); printer.bold(false);
+    printer.bold(true); printer.println('ENDERECO'); printer.bold(false);
     printer.drawLine();
-    items.forEach(it => { printer.bold(true); printer.leftRight(`${it.qty}x ${it.name}`, money(it.price * it.qty)); printer.bold(false); });
-    if (order.obs) { printer.drawLine(); printer.println('Obs: ' + order.obs); }
+    printer.println(order.address || '-');
     printer.drawLine();
-    printer.println(`Pagamento: ${payMethodTicketLabel(order)}${order.paid ? ' (PAGO)' : ''}`);
-    printer.setTextDoubleHeight(); printer.bold(true);
-    printer.leftRight('TOTAL', money(order.total));
-    printer.bold(false); printer.setTextNormal();
+    printer.bold(true); printer.println('PAGAMENTO'); printer.bold(false);
+    printer.drawLine();
+    printer.println(payMethodTicketLabel(order));
+    printer.leftRight('Total:', money(order.total));
+    if (order.troco) printer.leftRight('Troco para:', String(order.troco));
+    printer.drawLine();
+    printer.leftRight('Taxa de entrega:', money(order.fee));
+    printer.leftRight('Motoboy:', order.courierName || 'A definir');
+    // v131 — BUG CORRIGIDO ("tempo de entrega deve ser o que está definido no sistema"):
+    // igual à via do Caixa acima, agora usa order._deliveryWindow (calculado pelo servidor a
+    // partir de cfg.time/cfg.timeRetirada) em vez de não mostrar nada.
+    printer.leftRight('Previsao:', order._deliveryWindow || '—');
+    if (order.obs) { printer.drawLine(); printer.bold(true); printer.println('OBSERVACAO'); printer.bold(false); printer.println(order.obs); }
   } else {
     printer.println((STATION_LABELS[station] || station).toUpperCase());
     printer.println('VIA DE PRODUCAO');
     printer.alignLeft();
-    printer.println((order.ticketNumber ? `Pedido Nº ${order.ticketNumber}` : `Pedido #${order.id}`) + `  Ref.: #${String(order.id).slice(-11).toUpperCase()}`);
+    printer.println(`Ref.: #${String(order.id).slice(-11).toUpperCase()}`);
     printer.println(order.mode === 'delivery' ? 'DELIVERY' : 'RETIRADA');
     printer.drawLine();
     printer.bold(true); printer.println('ITENS DA ' + (STATION_LABELS[station] || station).toUpperCase()); printer.bold(false);
     printer.drawLine();
-    items.forEach(it => printer.println('* ' + it.qty + 'x ' + it.name));
+    items.forEach(it => {
+      // v128 — NOVO ("nome do item deve ser maior e em negrito na comanda da cozinha e
+      // sushibar pra melhor visualização"): só o NOME do item vem com largura +1 (relativo
+      // ao tamanho já configurado em Fonte de Impressão, "tam.w" acima) + negrito —
+      // setTextDoubleWidth()/setTextNormal() reiniciariam o tamanho pro padrão de fábrica da
+      // impressora, perdendo o "tam.h/tam.w" configurado pra todo o resto do ticket; por
+      // isso usa setTextSize(tam.h, tam.w+1) e depois volta pro tam.h/tam.w original — nunca
+      // pro zero. Largura tem teto (min 5) pra não sair um nome gigante ilegível.
+      printer.print('* ' + it.qty + 'x ');
+      printer.bold(true); printer.setTextSize(tam.h, Math.min(tam.w + 1, 5));
+      printer.println(it.name);
+      printer.bold(false); printer.setTextSize(tam.h, tam.w);
+    });
     printer.drawLine();
     printer.println('Observacoes:');
     if (order.obs) printer.println(order.obs);
@@ -265,6 +385,10 @@ function printStationTicket(printer, order, station, storeName) {
   }
   printer.newLine();
   printer.cut();
+  // v126 — NOVO ("fazer um bip duplo ao imprimir"): mesmo comando de campainha dupla usado
+  // no lado do servidor (ver ESC.beep em server.js) — printer.beep(2,2) apita 2 vezes.
+  // Impressora sem campainha (ou desligada no hardware) simplesmente ignora, sem erro.
+  printer.beep(2, 2);
   return true;
 }
 
@@ -280,7 +404,7 @@ function printReservationTicket(printer, reservation, storeName) {
   printer.bold(true); printer.setTextDoubleHeight();
   printer.println((storeName || 'SHOGATSU').toUpperCase());
   printer.setTextNormal(); printer.bold(false);
-  printer.println('CULINARIA ORIENTAL');
+  // v133 — mesma correção do cabeçalho de pedido acima (nome da loja repetido).
   printer.drawLine();
   printer.setTextSize(tam.h, tam.w);
   printer.bold(true); printer.println('RESERVA DE MESA'); printer.bold(false);
@@ -318,8 +442,18 @@ async function printReservation(reservation) {
     return;
   }
   const printerCfg = printerForStation('caixa');
-  if (!printerCfg) { log(`⚠️  Nenhuma impressora configurada pra via "caixa" — reserva ${reservation.id} não impressa.`); return; }
-  if (TEST_MODE) { log(`🧪 [TEST_MODE] Imprimiria agora a reserva ${reservation.id} (impressora: ${printerCfg.label})`); return; }
+  if (!printerCfg) { await releasePrintJob({kind:'reservation',id:reservation.id,station:'caixa'}); log(`⚠️  Nenhuma impressora configurada pra via "caixa" — reserva ${reservation.id} não impressa.`); return; }
+  // v126 — AUDITORIA — BUG CORRIGIDO ("aviso de já impressa" numa reserva que nunca imprimiu
+  // de verdade): em TEST_MODE, esta função reclamava a trava (claimPrintJob, linha acima) e
+  // então retornava aqui embaixo SEM chamar completeReservationPrint() nem releasePrintJob() —
+  // a trava ficava presa em status "printing" por até 90s (o "lease" do claim), e se alguém
+  // desligasse o Modo Teste e reiniciasse o Agente nesse intervalo pra imprimir de verdade, a
+  // segunda tentativa também podia esbarrar na trava ainda não liberada. Pior: se o Modo Teste
+  // ficasse ligado por engano com autoAcceptReservations também ligado, a reserva real nunca
+  // seria marcada como concluída nem liberada pra reimpressão manual soar corretamente no
+  // painel. Como aqui não existe impressora física nenhuma envolvida (é só simulação), a trava
+  // é liberada na mesma hora — nunca fica presa "achando" que já imprimiu algo que não imprimiu.
+  if (TEST_MODE) { log(`🧪 [TEST_MODE] Imprimiria agora a reserva ${reservation.id} (impressora: ${printerCfg.label})`); await releasePrintJob({kind:'reservation',id:reservation.id,station:'caixa'}); return; }
   const printer = buildPrinter(printerCfg);
   const isWinPrinter = isWindowsNamedPrinter(printerCfg);
   try {
@@ -329,10 +463,13 @@ async function printReservation(reservation) {
     }
     printReservationTicket(printer, reservation, cfg.storeName);
     printer.newLine(); printer.cut();
+    printer.beep(2, 2); // v126 — bipe duplo (mesma ideia da via de pedido acima)
     if (isWinPrinter) sendRawBufferToWindowsPrinter(windowsPrinterName(printerCfg), printer.getBuffer());
     else await printer.execute();
+    await completeReservationPrint(reservation.id);
     log(`✅ Reserva ${reservation.id} impressa com sucesso na impressora "${printerCfg.label}".`);
   } catch (err) {
+    await releasePrintJob({kind:'reservation',id:reservation.id,station:'caixa'});
     log(`❌ Falha ao imprimir reserva ${reservation.id} (impressora "${printerCfg.label}"): ${err.message}`);
   }
 }
@@ -347,7 +484,7 @@ async function printReservation(reservation) {
 // tenta de novo pra não atrasar a próxima impressão.
 async function reportPrintResult(order, station, ok, error) {
   try {
-    await request('POST', `${cfg.serverUrl}/api/print-ack`, { orderId: order.id, station, ok, error: error || null });
+    await request('POST', `${cfg.serverUrl}/api/print-ack`, { orderId: order.id, station, ok, error: error || null, agentId: AGENT_ID });
   } catch (e) { log(`⚠️  Não consegui avisar o servidor sobre o resultado da via "${station}" (${ok ? 'sucesso' : 'falha'}): ${e.message}`); }
 }
 
@@ -365,7 +502,7 @@ async function reportPrintResult(order, station, ok, error) {
 // um pedido é muito pior num restaurante; fica tudo registrado no log local de qualquer forma.
 async function claimPrintJob({ kind, id, station }) {
   try {
-    const r = await request('POST', `${cfg.serverUrl}/api/print-agent/claim?token=${encodeURIComponent(token)}`, { kind, id, station });
+    const r = await request('POST', `${cfg.serverUrl}/api/print-agent/claim?token=${encodeURIComponent(token)}`, { kind, id, station, agentId: AGENT_ID });
     if (r.status === 200 && r.data) return !!r.data.claimed;
     return true; // resposta inesperada do servidor — não bloqueia a impressão por causa disso
   } catch (e) {
@@ -373,6 +510,9 @@ async function claimPrintJob({ kind, id, station }) {
     return true;
   }
 }
+
+async function releasePrintJob({kind,id,station}){try{await request('POST',`${cfg.serverUrl}/api/print-agent/release?token=${encodeURIComponent(token)}`,{kind,id,station,agentId:AGENT_ID});}catch(e){log(`⚠️ Não consegui liberar a trava de impressão de ${kind==='reservation'?'reserva':'pedido'} ${id}: ${e.message}`);}}
+async function completeReservationPrint(id){try{await request('POST',`${cfg.serverUrl}/api/print-agent/complete?token=${encodeURIComponent(token)}`,{kind:'reservation',id});}catch(e){log(`⚠️ Não consegui confirmar impressão da reserva ${id}: ${e.message}`);}}
 
 async function printSingleStation(order, station) {
   const printerCfg = printerForStation(station);
@@ -440,7 +580,7 @@ async function printOrder(order) {
     // e sem bloquear vias/estações diferentes entre si.
     const claimed = await claimPrintJob({ kind: 'order', id: order.id, station });
     if (!claimed) {
-      log(`⏭️  Pedido ${order.id} — via "${station}" já foi reclamada/impressa por outro Agente antes — pulando (evita duplicidade).`);
+      log(`⏭️  Pedido ${order.id} — via "${station}" já está em processamento ou concluída por outro Agente — pulando (anti-duplicidade).`);
       continue;
     }
     const r = await printSingleStation(order, station);
@@ -503,6 +643,7 @@ async function printTestTicket(payload) {
     printer.println(new Date().toLocaleString('pt-BR'));
     printer.setTextNormal();
     printer.newLine(); printer.cut();
+    printer.beep(2, 2); // v126 — bipe duplo também no teste de impressão (consistência)
     if (isWinPrinter) {
       sendRawBufferToWindowsPrinter(windowsPrinterName(printerCfg), printer.getBuffer());
     } else {
@@ -559,6 +700,7 @@ async function login() {
   log(`🔑 Login OK (${cfg.username}).`);
   announcePresence();
   startStationStatusPolling();
+  startPendingRecoveryPolling();
 }
 
 // v82: avisa o servidor "estou vivo" logo após logar, e de novo a cada ~45s enquanto o agente
@@ -627,6 +769,37 @@ function isAuthorizedToPrint() {
   if (!stationStatus.active) return false; // painel fechado em todo lugar agora — não imprime
   if (!STATION_ID) return true; // sem stationId configurado: só a checagem acima já basta
   return stationStatus.activeStationId === STATION_ID;
+}
+
+let pendingPollTimer = null;
+let pendingPollBusy = false;
+async function recoverPendingPrints() {
+  if (!token || pendingPollBusy) return;
+  pendingPollBusy = true;
+  try {
+    const r = await request('GET', `${cfg.serverUrl}/api/print-agent/pending?token=${encodeURIComponent(token)}`);
+    if (r.status !== 200 || !r.data) return;
+    const orders = Array.isArray(r.data.orders) ? r.data.orders : [];
+    const reservations = Array.isArray(r.data.reservations) ? r.data.reservations : [];
+    if (orders.length || reservations.length) log(`🔄 Recuperação de impressão: ${orders.length} pedido(s), ${reservations.length} reserva(s) pendente(s).`);
+    for (const order of orders) {
+      try { await printOrder({ ...order, _printFontSize: order._printFontSize || cfg.printSize, _autoAcceptOn: true }); }
+      catch (e) { log(`⚠️ Falha na recuperação do pedido ${order.id}: ${e.message}`); }
+    }
+    for (const reservation of reservations) {
+      try { await printReservation({ ...reservation, _printFontSize: reservation._printFontSize || cfg.printSize, storeName: cfg.storeName }); }
+      catch (e) { log(`⚠️ Falha na recuperação da reserva ${reservation.id}: ${e.message}`); }
+    }
+  } catch (e) {
+    log(`⚠️ Fila de recuperação indisponível: ${e.message}`);
+  } finally {
+    pendingPollBusy = false;
+  }
+}
+function startPendingRecoveryPolling() {
+  clearInterval(pendingPollTimer);
+  recoverPendingPrints();
+  pendingPollTimer = setInterval(recoverPendingPrints, PENDING_POLL_MS);
 }
 
 function connectStream() {
@@ -722,7 +895,7 @@ function scheduleReconnect() {
 // aqui (como a de tamanho de fonte) só passa a valer de verdade depois de rodar
 // REINICIAR-AGENTE.bat. Esse marcador serve pra conferir, olhando o log, se o processo rodando
 // agora é realmente a versão mais nova dos arquivos.
-const AGENT_BUILD = 'v96 (correção: reconexão não cria sessão nova)';
+const AGENT_BUILD = 'v122 (impressão resiliente + retry + lease anti-duplicidade)';
 async function start() {
   log(`🍣 Agente de impressão iniciando (build ${AGENT_BUILD})${TEST_MODE ? ' (TEST_MODE — não vai imprimir de verdade)' : ''}...`);
   log(`ℹ️  Se você acabou de atualizar os arquivos do sistema, confirme que esse número de build bate com o mais recente — senão, rode REINICIAR-AGENTE.bat pra esse processo carregar o código novo (trocar o arquivo no disco sozinho não reinicia quem já está rodando).`);
