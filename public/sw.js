@@ -14,7 +14,7 @@
 // tela inicial (start_url) certos pra ela — pra abrir direto na página certa quando
 // instalada, em vez de sempre cair em "/". Cache sobe de v5 pra v6 pra já entregar esses
 // arquivos novos pra quem já tinha o service worker instalado antes.
-const CACHE = 'shogatsu-v7';
+const CACHE = 'shogatsu-v8';
 const ASSETS = [
   '/manifest.json',
   '/manifest-painel.json',
@@ -26,6 +26,8 @@ const ASSETS = [
   '/manifest-pedir-agora.json',
   '/icon-192.png',
   '/icon-512.png',
+  '/favicon.png',
+  '/apple-touch-icon.png',
   'https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,600;1,400&family=Jost:wght@300;400;500;600&display=swap'
 ];
 // BUG CORRIGIDO (v43 — "notificação push não chega"): o `cache.addAll(ASSETS)` falha por

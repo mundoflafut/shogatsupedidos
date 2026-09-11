@@ -9,6 +9,7 @@
 <meta name="apple-mobile-web-app-title" content="Shogatsu">
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" href="/favicon.png">
 <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="favicon-16.png">
 <title>Shogatsu · Peça Agora</title>
@@ -241,7 +242,14 @@ button{cursor:pointer;font-family:'Jost',sans-serif;}
 .item-desc-toggle:active{opacity:.7;}
 .item-footer{display:flex;align-items:center;justify-content:space-between;gap:8px;}
 .item-price{font-family:'Cormorant Garamond',serif;font-size:calc(21px * var(--menu-fs-scale,1));font-weight:700;color:var(--red-lt);letter-spacing:.2px;}
-.item-badge{font-size:10px;font-weight:700;letter-spacing:.5px;color:#3a2a00;background:linear-gradient(90deg,#FFD54A,#FFB300);padding:3px 10px;border-radius:20px;margin-bottom:6px;display:inline-block;}
+.item-badge{font-size:10px;font-weight:700;letter-spacing:.3px;color:#fff;background:linear-gradient(135deg,#b3261e,#8f1d18);padding:5px 10px;border-radius:999px;margin-bottom:7px;display:inline-flex;align-items:center;gap:4px;line-height:1;box-shadow:0 3px 10px rgba(0,0,0,.22);border:1px solid rgba(201,168,76,.55);}
+.item-img .item-badge{margin:0;}
+/* v121: opção 6 — selo acima do preço, sem cobrir a foto. */
+.item-footer .item-badge-price{margin:0 0 6px auto;font-size:9px;padding:4px 9px;box-shadow:0 2px 8px rgba(0,0,0,.18);}
+.item-footer{position:relative;flex-wrap:wrap;}
+.item-footer .item-badge-price{flex-basis:auto;order:0;}
+.item-footer .item-price{order:1;}
+.item-footer .add-btn,.item-footer .qty-ctrl,.item-footer>span:not(.item-price){order:2;}
 .item-promo-tag{margin-top:6px;font-size:11px;font-weight:700;color:#3a2a00;background:linear-gradient(90deg,#FFD54A,#FFB300);padding:4px 10px;border-radius:6px;display:inline-block;letter-spacing:.3px;}
 
 .add-btn{background:var(--red);border:none;border-radius:50%;width:36px;height:36px;color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .2s,transform .18s cubic-bezier(.34,1.56,.64,1),box-shadow .18s ease;-webkit-tap-highlight-color:transparent;}
@@ -668,6 +676,18 @@ button:active, .btn:active, [role="button"]:active, .pay-opt:active, .cat-tab:ac
 .time-slot-btn:active,.time-slot-btn.touch-active{transform:scale(.94);box-shadow:0 2px 8px rgba(227,189,106,.35);}
 .time-slot-btn.selected{background:var(--gold,#e3bd6a);color:#1a1400;border-color:var(--gold,#e3bd6a);box-shadow:0 4px 14px rgba(227,189,106,.4);}
 .time-slot-btn.selected:hover{transform:translateY(-2px) scale(1.04);}
+
+/* v121 — detalhe japonês premium: selo discreto, vermelho vermelhão + ouro, sem alterar o layout. */
+.item-card .item-badge-price{font-family:inherit;text-transform:none;}
+@media(max-width:520px){.item-footer .item-badge-price{font-size:8.5px;padding:4px 8px;margin-bottom:5px;}}
+</style>
+<style id="v125-part3-client-badge">
+/* Badge único: abaixo da descrição; não altera posição do preço. */
+.item-badge-wrap-below-desc{display:block!important;margin:8px 0 2px!important;position:relative!important;z-index:1!important}
+.item-badge-wrap-below-desc .item-badge{display:inline-flex!important;position:static!important;float:none!important;margin:0!important;max-width:100%!important;box-sizing:border-box!important}
+.item-footer .item-badge-price,.item-card .item-badge-price{display:none!important}
+.item-badge-icon{flex:0 0 auto!important}
+.item-badge-text{min-width:0!important;overflow:hidden!important;text-overflow:ellipsis!important}
 </style>
 </head>
 <body>
@@ -1628,10 +1648,22 @@ function onRsvDateChange(){
   const slotsEl = document.getElementById('rsv-time-slots');
   document.getElementById('rsv-time').value = '';
   if (!dateVal) { warnEl.style.display='none'; slotsWrap.style.display='none'; return; }
+  // v126 — datas específicas bloqueadas pra reserva (feriado, evento fechado etc.), mesmo
+  // em dias que normalmente aceitam reserva (Configurações → 📅 Disponibilidade de Reserva).
+  if (cfg.reservations && Array.isArray(cfg.reservations.blockedDates) && cfg.reservations.blockedDates.includes(dateVal)) {
+    warnEl.textContent = '⛔ Sem reservas disponíveis nessa data — escolha outra.';
+    warnEl.style.display = 'block';
+    slotsWrap.style.display = 'none';
+    return;
+  }
+  // v126 — horário PRÓPRIO de reserva, se configurado (pode ser diferente do horário normal
+  // de funcionamento da loja) — cai no horário normal se "usar mesmo horário da loja" estiver
+  // ligado (padrão, comportamento de sempre).
+  const effectiveSchedule = (cfg.reservations && cfg.reservations.useStoreSchedule===false && Array.isArray(cfg.reservations.schedule)) ? cfg.reservations.schedule : cfg.weekSchedule;
   const weekday = new Date(dateVal + 'T00:00').getDay();
-  const daySchedule = (cfg.weekSchedule && cfg.weekSchedule[weekday]) || null;
+  const daySchedule = (effectiveSchedule && effectiveSchedule[weekday]) || null;
   if (daySchedule && daySchedule.open === false) {
-    warnEl.textContent = '⛔ Fechado nesse dia — escolha outra data.';
+    warnEl.textContent = '⛔ Sem reservas disponíveis nesse dia — escolha outra data.';
     warnEl.style.display = 'block';
     slotsWrap.style.display = 'none';
     return;
@@ -2809,15 +2841,24 @@ function itemPlaceholderHtml(icon){
 // v73: resolve o badge de um item — respeita item.badgeMode ('global' herda o Badge Global,
 // 'manual' usa o texto próprio do item, 'off' não mostra nenhum badge.
 function itemBadgeHtml(item){
-  const mode = item.badgeMode || 'global';
-  if (mode === 'off') return '';
-  if (mode === 'manual') return item.badge ? `<div class="item-badge">${item.badge}</div>` : '';
-  const gb = cfg.globalBadge;
-  if (gb && gb.enabled) {
-    const style = `background:${gb.bgColor};color:${gb.textColor};font-size:${gb.fontSize}px;font-weight:${gb.fontWeight};opacity:${(gb.opacity==null?100:gb.opacity)/100};border-radius:${gb.borderRadius}px;padding:${gb.padding}px ${Number(gb.padding)+4}px;${gb.borderEnabled?`border:1px solid ${gb.borderColor};`:''}${gb.shadow?'box-shadow:0 2px 6px rgba(0,0,0,.35);':''}`;
-    return `<div class="item-badge" style="${style}">${gb.icon ? gb.icon+' ' : ''}${gb.text}</div>`;
-  }
-  return item.badge ? `<div class="item-badge">${item.badge}</div>` : '';
+  const mode=item.badgeMode||'global';
+  if(mode==='off') return '';
+  const raw=String(item.badge||'').trim();
+  let icon=String(item.badgeIcon||'').trim();
+  let text=String(item.badgeText||raw||'').trim();
+  const known={'🔥':'Mais vendido','⭐':'Novidade','💎':'Premium','♥':'Recomendado','❤':'Recomendado'};
+  const lead=/^(🔥|⭐|💎|♥|❤|🍣|✨|🏆)\s*/;
+  const m=text.match(lead);
+  if(m){ if(!icon) icon=m[1]; text=text.slice(m[0].length).trim(); }
+  if(!icon && raw){ const rm=raw.match(lead); if(rm){ icon=rm[1]; text=raw.slice(rm[0].length).trim(); } }
+  if(!text && icon && known[icon]) text=known[icon];
+  if(!icon && known[raw]) { icon=raw; text=known[raw]; }
+  if(mode!=='manual' && !text && !icon) return '';
+  if(!text) text='Destaque';
+  const size=Math.max(11,Math.min(18,Number(item.badgeSize)||13));
+  const bg=item.badgeColor||'#C62828';
+  const fg=item.badgeTextColor||'#FFFFFF';
+  return `<span class="item-badge" style="--badge-bg:${bg};--badge-fg:${fg};--badge-size:${size}px;">${icon?`<span class="item-badge-icon" aria-hidden="true">${esc(icon)}</span>`:''}<span class="item-badge-text">${esc(text)}</span></span>`;
 }
 function renderMenu() {
   document.getElementById('hero-address').textContent = cfg.addr;
@@ -2925,16 +2966,16 @@ function renderMenu() {
         // mudava a pré-visualização no painel, nunca o cardápio de verdade pro cliente (o badge
         // ficava sempre "grudado" no mesmo lugar, por isso parecia "travado"). Agora a posição
         // escolhida é aplicada aqui de verdade.
-        const badgePos = !isAvail ? 'abaixo-foto' : ((cfg.globalBadge && cfg.globalBadge.position) || 'abaixo-foto');
-        const badgeCornerStyle = badgePos==='sobre-foto' ? 'position:absolute;top:6px;left:6px;z-index:2;'
-          : badgePos==='canto-superior-esquerdo' ? 'position:absolute;top:6px;left:6px;z-index:2;'
-          : badgePos==='canto-superior-direito' ? 'position:absolute;top:6px;right:38px;z-index:2;'
-          : '';
-        const badgeInsideImg = badgeHtml && ['sobre-foto','canto-superior-esquerdo','canto-superior-direito'].includes(badgePos);
-        const badgeAboveImg = badgeHtml && badgePos==='acima-foto';
-        const badgeBelowImg = badgeHtml && badgePos==='abaixo-foto';
-        const badgeAboveName = badgeHtml && badgePos==='acima-nome';
-        const badgeBelowName = badgeHtml && badgePos==='abaixo-nome';
+        // v121: posição fixa premium — opção 6, badge acima do preço.
+        // Mantém o modelo original do card e altera somente o ponto visual do selo.
+        // v124: posição única e fixa — abaixo da descrição, dentro do card.
+        // O preço e a estrutura do card permanecem exatamente no lugar original.
+        const badgeInsideImg = false;
+        const badgeAboveImg = false;
+        const badgeBelowImg = false;
+        const badgeAboveName = false;
+        const badgeBelowName = false;
+        const badgeAbovePrice = false;
         return `
         <div class="item-card" id="card-${key}" style="${isAvail ? '' : 'opacity:.55;'}">
           ${badgeAboveImg ? badgeHtml : ''}
@@ -2948,8 +2989,9 @@ function renderMenu() {
             ${badgeAboveName ? badgeHtml : ''}
             <div class="item-name">${item.name}</div>
             ${badgeBelowName ? badgeHtml : ''}
-            <div class="item-desc${item.desc ? ' clamped' : ''}" id="desc-${key}">${item.desc}${item.qty ? ` <span style="color:var(--muted);font-size:10px">(${item.qty})</span>` : ''}</div>
+            <div class="item-desc${item.desc ? ' clamped' : ''}" id="desc-${key}">${item.desc}${item.qty ? ` <span class="item-portion-inline">· ${esc(item.qty)}</span>` : ''}</div>
             ${item.desc ? `<button type="button" class="item-desc-toggle" id="desc-toggle-${key}" onclick="toggleItemDesc('${key}', event)">⌄ Ver mais</button>` : ''}
+            ${badgeHtml ? `<div class="item-badge-wrap-below-desc">${badgeHtml}</div>` : ''}
             ${cartQty > 0 ? `<div class="mi-in-cart-tag">🛒 ${cartQty} no carrinho</div>` : ''}
             <div class="item-footer">
               ${(() => {
@@ -3516,6 +3558,9 @@ function setPlaceBtnState(state, customLabel) {
   label.textContent = customLabel || (state === 'loading' ? 'Enviando pedido...' : state === 'blocked' ? 'Indisponível no momento' : '🛒 Finalizar Pedido');
 }
 
+function showPendingOrderRetry(){let b=document.getElementById('shog-pending-order');if(!b){b=document.createElement('div');b.id='shog-pending-order';b.style='position:fixed;left:12px;right:12px;bottom:84px;z-index:9999;background:#171717;color:#fff;border:1px solid #C62828;border-radius:12px;padding:12px;box-shadow:0 8px 30px rgba(0,0,0,.35);font:13px sans-serif;';document.body.appendChild(b);}b.innerHTML='<b>⚠️ Pedido aguardando conexão</b><div style="font-size:11px;margin-top:4px;opacity:.8">Sua tentativa foi guardada. Quando a internet voltar, toque em Tentar novamente.</div><div style="display:flex;gap:6px;margin-top:8px"><button type="button" style="flex:1;padding:9px;border:0;border-radius:8px;background:#C62828;color:#fff;font-weight:700" onclick="retryPendingOrder()">↻ Tentar novamente</button><button type="button" style="padding:9px 12px;border:1px solid #444;border-radius:8px;background:#222;color:#fff" onclick="this.closest(\"#shog-pending-order\").remove()">Fechar</button></div>';}
+async function retryPendingOrder(){try{const raw=localStorage.getItem('shogatsu_pending_order');if(!raw)return;const p=JSON.parse(raw);const r=await fetch('/api/orders',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...p.payload,idempotencyKey:p.idempotencyKey})});const d=await r.json();if(!r.ok)throw new Error(d.error||'Não foi possível reenviar.');localStorage.removeItem('shogatsu_pending_order');document.getElementById('shog-pending-order')?.remove();window._placeOrderIdemKey=null;alert('✅ Pedido confirmado!');}catch(e){alert('Ainda sem conexão. Tente novamente em alguns segundos.');}}
+function initPendingOrderRetry(){try{const raw=localStorage.getItem('shogatsu_pending_order');if(raw&&Date.now()-Number(JSON.parse(raw).savedAt||0)<86400000)showPendingOrderRetry();else localStorage.removeItem('shogatsu_pending_order');}catch(e){}}
 async function placeOrder() {
   if (!Number(cfg.open)) { alert('O restaurante está fechado no momento. Tente novamente durante o horário de funcionamento: ' + cfg.hours); return; }
 
@@ -3584,10 +3629,10 @@ async function placeOrder() {
     // Pedido confirmado (novo ou recuperado via idempotência) — libera a chave pra próxima compra.
     window._placeOrderIdemKey = null;
   } catch (e) {
-    // Erro de rede: NÃO libera a chave. Se o cliente tentar de novo (ou o app tentar sozinho),
-    // a mesma chave é reenviada — se o pedido já tinha sido salvo no servidor antes da conexão
-    // cair, o backend reconhece a chave e devolve o pedido existente em vez de duplicar.
-    alert('Erro de conexão. Verifique sua internet e tente novamente. Se o pedido já tiver sido registrado, ele não será duplicado.');
+    // v122: guarda a tentativa localmente. O cliente pode recuperar o pedido sem perder o carrinho
+    // e sem criar duplicidade, porque a mesma idempotencyKey continua sendo reutilizada.
+    try{ localStorage.setItem('shogatsu_pending_order', JSON.stringify({savedAt:Date.now(),idempotencyKey,payload:{mode,name,phone,address,hood,items,obs,payMethod,troco,subtotal,fee,total,couponCode:appliedCoupon?appliedCoupon.code:'',redeemPoints:pointsDiscountValue().points,scheduledFor}})); }catch(err){}
+    showPendingOrderRetry();
     setPlaceBtnState('idle');
     return;
   }
@@ -4328,6 +4373,7 @@ if (typeof ResizeObserver !== 'undefined') {
 loadCustomerSession();
 loadConfig();
 connectPublicSSE();
+initPendingOrderRetry();
 attachCheckoutDraftListeners(); // v52: liga a gravação automática do rascunho do formulário de entrega
 loadCheckoutDraft(); // v52: já preenche os campos com o último rascunho salvo, mesmo antes de abrir o checkout
 loadReviews();
@@ -4546,5 +4592,18 @@ updatePushButtonState();
 <link rel="stylesheet" href="/install-prompt.css">
 <script src="/install-prompt.js" defer></script>
 <script src="/version-check.js"></script>
+<style id="shog-v122-client-badge">
+.item-badge-price{display:inline-flex!important;align-items:center!important;justify-content:flex-end!important;max-width:100%;white-space:nowrap}.item-portion-inline{color:var(--muted);font-size:10px;white-space:nowrap}.item-footer{align-items:flex-end!important;gap:8px!important}.item-footer .item-badge-price{margin:0 0 5px auto!important}.item-badge{letter-spacing:.15px!important;text-transform:none!important}@media(max-width:520px){.item-footer .item-badge-price{font-size:inherit!important}.item-portion-inline{font-size:9.5px}}
+</style>
+
+<style id="shog-v124-badge-final">
+/* v124 FINAL — badge único, abaixo da descrição; preço permanece intocado. */
+.item-badge-wrap-below-desc{display:block;margin:8px 0 2px;min-height:0;}
+.item-badge-wrap-below-desc .item-badge{display:inline-flex!important;align-items:center!important;gap:6px!important;width:max-content!important;max-width:100%!important;box-sizing:border-box!important;margin:0!important;padding:6px 10px!important;border-radius:999px!important;border:1px solid color-mix(in srgb,var(--badge-bg,#C62828) 72%,#fff 28%)!important;background:color-mix(in srgb,var(--badge-bg,#C62828) 12%,transparent)!important;color:var(--badge-fg,#fff)!important;font-size:var(--badge-size,13px)!important;font-weight:750!important;line-height:1!important;letter-spacing:.2px!important;text-transform:none!important;box-shadow:none!important;}
+.item-badge-wrap-below-desc .item-badge-icon{display:inline-flex!important;align-items:center!important;justify-content:center!important;font-size:1em!important;line-height:1!important;}
+.item-badge-wrap-below-desc .item-badge-text{display:inline-block!important;line-height:1.05!important;}
+.item-footer .item-badge-price{display:none!important;}
+@media(max-width:520px){.item-badge-wrap-below-desc{margin-top:7px}.item-badge-wrap-below-desc .item-badge{font-size:min(var(--badge-size,13px),13px)!important;padding:5px 9px!important;gap:5px!important;}}
+</style>
 </body>
 </html>
