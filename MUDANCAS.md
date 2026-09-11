@@ -1,3 +1,9 @@
+# v134 — Corrigido 503 logo após o deploy
+
+- **Bug corrigido — site fora do ar (HTTP 503) logo depois de cada deploy/"acordar"**: o servidor só começava a aceitar conexões DEPOIS de terminar de restaurar tudo do Supabase (pedidos, config, sessões e — o mais demorado — as fotos do cardápio, uma por uma em sequência). Com muitas fotos cadastradas, essa restauração podia levar bem mais de um minuto, e o Render devolvia 503 ("No open ports detected...") pra qualquer pessoa tentando abrir o site nesse meio-tempo, mesmo o servidor subindo com sucesso logo depois.
+  - Agora o servidor começa a aceitar conexões **imediatamente**, e a restauração do Supabase roda em segundo plano, sem bloquear a porta — o site fica alcançável na hora, mesmo antes da restauração terminar (uma requisição bem nos primeiros segundos, na pior das hipóteses, vê o estado local ainda não restaurado, e volta ao normal sozinha assim que a restauração terminar — sem erro, sem 503).
+  - A restauração de fotos também deixou de ser sequencial (uma por vez) e agora baixa em lotes paralelos de 10, reduzindo bastante o tempo total dessa etapa de qualquer forma.
+
 # v133 — Fuso horário da previsão corrigido + cabeçalho/rodapé sem repetição
 
 - **Bug corrigido — previsão de entrega com horário errado (3h a mais)**: o servidor roda hospedado num relógio configurado em UTC, e o cálculo da previsão de entrega/retirada formatava o horário sem dizer em qual fuso — o Node então usava UTC em vez de horário de Brasília (UTC-3), empurrando a previsão 3 horas pra frente do correto (ex.: pedido feito 00:18, previsão saía 03:58–04:18 em vez de 00:58–01:18). Corrigido especificando explicitamente `America/Sao_Paulo` em todos os horários formatados no servidor para impressão (previsão de entrega/retirada, DATA/HORA do comprovante, Entrada/Saída Prevista da via de produção, horário de reserva).

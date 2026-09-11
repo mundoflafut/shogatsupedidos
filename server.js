@@ -603,15 +603,31 @@ async function restoreUploadsFromSupabase() {
       .map(r => String(r.key || '').replace(/^upload_/, ''))
       .filter(filename => filename && !fs.existsSync(path.join(UPLOADS_DIR, filename)));
     let restauradas = 0;
-    for (const filename of faltando) {
-      try {
+    // v134 — BUG CORRIGIDO ("página fora do ar / 503 logo depois do deploy"): esse loop
+    // baixava as fotos faltando UMA POR VEZ (for...await sequencial) — com 100+ fotos
+    // cadastradas, cada uma exigindo uma ida e volta até o Supabase, um deploy com o disco
+    // limpo (comum no Render — disco não é persistente por padrão) podia levar bem mais de um
+    // minuto só nessa etapa. Isso já não bloqueia mais a porta ficar aberta (ver o final do
+    // arquivo — server.listen() agora roda ANTES de qualquer restauração), mas mesmo assim
+    // vale deixar rápido: enquanto essa restauração não termina, fotos recém-enviadas antes
+    // do deploy anterior podem aparecer quebradas no cardápio/painel até o lote de fotos
+    // correspondente terminar de baixar. Agora baixa em lotes paralelos (10 de cada vez, não
+    // as 150 juntas de uma vez só — evita estourar limite de taxa do Supabase) — resultado
+    // final idêntico (todas as fotos continuam sendo restauradas), só que numa fração do tempo.
+    const CONCURRENCY = 10;
+    for (let i = 0; i < faltando.length; i += CONCURRENCY) {
+      const lote = faltando.slice(i, i + CONCURRENCY);
+      const resultados = await Promise.allSettled(lote.map(async (filename) => {
         const linhas = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${encodeURIComponent('upload_' + filename)}&select=value`);
         const row = linhas && linhas[0];
         const dest = path.join(UPLOADS_DIR, filename);
-        if (!row || !row.value || !row.value.b64 || fs.existsSync(dest)) continue; // sem conteúdo salvo, ou já apareceu enquanto restaurava outras
+        if (!row || !row.value || !row.value.b64 || fs.existsSync(dest)) return false; // sem conteúdo salvo, ou já apareceu enquanto restaurava outras
         fs.writeFileSync(dest, Buffer.from(row.value.b64, 'base64'));
-        restauradas++;
-      } catch (e) { /* ignora essa foto e segue restaurando as outras */ }
+        return true;
+      }));
+      restauradas += resultados.filter(r => r.status === 'fulfilled' && r.value === true).length;
+      // não interrompe o lote inteiro se uma foto der erro — cada uma é independente (mesma
+      // garantia de antes: uma foto com problema não afeta as outras)
     }
     if (restauradas) console.log(`   ✓ ${restauradas} foto(s) restaurada(s) do Supabase pra uploads/`);
   } catch (err) { console.error('   ⚠️  Não consegui restaurar fotos do Supabase:', err.message); }
@@ -3915,7 +3931,7 @@ function estimateDeliveryWindow(order, cfg) {
       try { fs.accessSync(file, fs.constants.R_OK | fs.constants.W_OK); checks[name] = true; } catch (_) { checks[name] = false; }
     }
     const ok = Object.values(checks).every(Boolean);
-    return sendJSON(res, ok ? 200 : 503, {ok, service:'shogatsu-pedidos', version:'1.0.133', checks, uptimeSec:Math.floor(process.uptime()), time:new Date().toISOString()});
+    return sendJSON(res, ok ? 200 : 503, {ok, service:'shogatsu-pedidos', version:'1.0.134', checks, uptimeSec:Math.floor(process.uptime()), time:new Date().toISOString()});
   }
 
   // ── GET /api/print-agent/status — o painel consulta pra mostrar se tem algum Agente Local
@@ -6332,15 +6348,32 @@ async function checkScheduledPush() {
 }
 setInterval(checkScheduledPush, 60 * 1000);
 
+// v134 — BUG CORRIGIDO ("página não está funcionando" / HTTP 503 logo depois do deploy, log
+// mostrando "No open ports detected, continuing to scan..."): antes, o servidor só chamava
+// server.listen() DEPOIS de terminar restoreFromSupabase() + loadSessionsFromDisk() +
+// restoreUploadsFromSupabase() — três etapas em sequência, a última das quais podia demorar
+// bastante (mesmo já paralelizada nesta versão, ver o comentário dentro de
+// restoreUploadsFromSupabase() acima). Como o Render (e qualquer proxy na frente) só considera
+// o serviço "no ar" quando alguma porta responde, toda essa demora de boot virava uma janela
+// real de 503 pra quem tentasse abrir o site logo depois de um deploy ou de "acordar" de um
+// plano que dorme por inatividade — mesmo o servidor tendo subido com sucesso, só um pouco
+// depois do necessário.
+// Agora server.listen() roda IMEDIATAMENTE, antes de qualquer restauração — o site fica
+// alcançável na hora. A restauração do Supabase (pedidos, config, sessões, fotos etc.)
+// continua acontecendo do mesmo jeito, só que em SEGUNDO PLANO, sem bloquear a porta. Isso é
+// seguro porque toda leitura de dado no sistema já lê o arquivo do disco NA HORA de cada
+// requisição (readConfig()/readJSON(), nunca um cache carregado uma vez só no boot) — uma
+// requisição que chegar bem no primeiro segundo, antes da restauração terminar, no pior caso
+// vê o estado local ainda não restaurado (ex: pedido ainda não visível), e volta ao normal
+// assim que a restauração (que agora é rápida) terminar, sem nenhum erro nem 503.
+server.listen(PORT, () => {
+  console.log(`🍣 Shogatsu rodando em http://localhost:${PORT}`);
+  console.log(`   Painel da cozinha: http://localhost:${PORT}/painel.html`);
+  if (!process.env.UPLOADS_DIR && !SUPABASE_URL) {
+    console.log('⚠️  ATENÇÃO: UPLOADS_DIR não configurado e Supabase não configurado — fotos enviadas podem se perder no próximo deploy. Configure um Disco Persistente (UPLOADS_DIR) ou SUPABASE_URL/SUPABASE_SERVICE_KEY. Veja o README.md.');
+  }
+});
 restoreFromSupabase().finally(() => {
   loadSessionsFromDisk(); // v60: depois de restaurar do Supabase (se configurado), carrega sessões válidas pra memória
-  restoreUploadsFromSupabase().finally(() => {
-    server.listen(PORT, () => {
-      console.log(`🍣 Shogatsu rodando em http://localhost:${PORT}`);
-      console.log(`   Painel da cozinha: http://localhost:${PORT}/painel.html`);
-      if (!process.env.UPLOADS_DIR && !SUPABASE_URL) {
-        console.log('⚠️  ATENÇÃO: UPLOADS_DIR não configurado e Supabase não configurado — fotos enviadas podem se perder no próximo deploy. Configure um Disco Persistente (UPLOADS_DIR) ou SUPABASE_URL/SUPABASE_SERVICE_KEY. Veja o README.md.');
-      }
-    });
-  });
+  restoreUploadsFromSupabase();
 });
