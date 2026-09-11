@@ -42,6 +42,7 @@ const CUSTOS_CONFIG_FILE = path.join(DATA_DIR, 'custos-config.json');
 // APROVAÇÕES DA IA" mais abaixo.
 const APROVACOES_IA_FILE = path.join(DATA_DIR, 'aprovacoes-ia.json');
 const DELETE_LOG_FILE = path.join(DATA_DIR, 'delete-log.json'); // v32: histórico de exclusões de pedidos
+const PERMISSION_LOG_FILE = path.join(DATA_DIR, 'permission-log.json'); // v109: histórico de alteração de permissões de usuário
 const CONTATOS_IMPORTADOS_FILE = path.join(DATA_DIR, 'contatos-importados.json'); // v56: contatos importados de CSV/vCard/txt, separado dos clientes reais (que vêm de pedidos)
 const ATENDIMENTO_FILE = path.join(DATA_DIR, 'atendimento.json'); // v57: conversas do chat (IA e/ou atendente humano)
 // v60: sessões de login persistidas em disco (+ Supabase, ver FILE_TO_KEY) — antes viviam só em
@@ -172,8 +173,26 @@ const DEFAULT_CFG = {
   },
   // ── Impressão do comprovante ──
   printFont: 'Verdana, sans-serif',      // 'monospace' | 'sans-serif' | 'serif' | outras opções na tela de config
-  printSize: 20,                // tamanho da fonte em px
+  // v126 — BUG CORRIGIDO ("ajuste padrão de tamanho pra caber na bobina 80mm"): o padrão de
+  // fábrica era 20px, mas 10-17px é a faixa que a impressora térmica trata como "tamanho
+  // normal dela" (ver tamanhoImpressaoTermica() logo abaixo) — 18px ou mais já liga o
+  // dobro de altura (GS ! n). Ou seja: TODA instalação nova, sem ninguém mexer em nada,
+  // já saía imprimindo cada comanda com o dobro da altura normal, gastando o dobro de
+  // bobina em cada impressão. 14px é o tamanho de referência usado em todo o resto do
+  // sistema (ver `scale = ps/14` em public/painel.html) — agora é também o padrão de
+  // fábrica, pra uma instalação nova já imprimir no tamanho normal da impressora até
+  // alguém decidir aumentar de propósito em Configurações → Central de Impressão.
+  printSize: 14,                // tamanho da fonte em px
   printColor: '#000000',        // cor do texto
+  // v126 — NOVO ("ajuste pra caber na bobina 80mm bematech"): até aqui a largura usada pra
+  // alinhar valores à direita e desenhar as linhas tracejadas na impressão direta (USB/rede,
+  // sem Agente Local) era um número FIXO de 32 colunas — que é o certo pra bobina de 58mm,
+  // mas deixa uma bobina de 80mm com bem menos texto por linha do que ela realmente
+  // comporta (a impressora tem espaço de sobra, mas o sistema nunca usava). Esse campo deixa
+  // a pessoa escolher a largura real da bobina que ela tem — 80mm (48 colunas, padrão de
+  // fábrica) ou 58mm (32 colunas) — e o texto passa a ocupar a largura certa em ambos os
+  // casos. Ver printCols() logo abaixo de ESC.
+  printWidth: '80mm',           // '58mm' (32 colunas) | '80mm' (48 colunas)
   // ── Logotipo ──
   logoShape: 'retangular',      // 'redondo' | 'quadrado' | 'retangular'
   logoSize: 40,                  // altura em px
@@ -187,8 +206,18 @@ const DEFAULT_CFG = {
     cozinha:   { label: 'Cozinha',   icon: '🍳', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 20, active: true },
     sushibar:  { label: 'Sushibar',  icon: '🍣', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 15, active: true },
     bar:       { label: 'Bar',       icon: '🍹', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 8, active: true },
-    delivery:  { label: 'Delivery',  icon: '🛵', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 0, active: true },
-    expedicao: { label: 'Expedição', icon: '📦', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 5, active: true }
+    // v129 — NOVO ("via do motoboy/expedição deve mostrar cliente/endereço/pagamento, não a
+    // lista de itens como cozinha/sushibar"): campo `kind: 'dispatch'` marca essas duas vias
+    // como "despacho" — usa o MESMO layout de dados de entrega da via do Caixa (cliente,
+    // telefone, endereço completo, referência, forma de pagamento, troco, motoboy, horário de
+    // saída), só que SEM os dados financeiros internos (custo/margem não existem nesse
+    // layout de qualquer forma) e sem a lista de itens do pedido — quem está saindo pra
+    // entregar não precisa conferir prato por prato, só pra onde ir e quanto cobrar. Qualquer
+    // via SEM "kind" (cozinha, sushibar, bar, ou uma via customizada nova) continua no layout
+    // de PRODUÇÃO de sempre (lista de itens). "caixa" é sempre comprovante — nunca usa este
+    // campo. Ver isCaixa/kind mais abaixo em POST /api/print.
+    delivery:  { label: 'Delivery',  icon: '🛵', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 0, active: true, kind: 'dispatch' },
+    expedicao: { label: 'Expedição', icon: '📦', method: 'navegador', ip: '', port: 9100, device: '', prepTime: 5, active: true, kind: 'dispatch' }
     // v46: método "automatica" — imprime sozinho, sem abrir navegador nem pedir confirmação,
     // através do Agente Local de Impressão (print-agent/), que roda num computador dentro da
     // loja ligado na impressora. Ver POST /api/print abaixo e print-agent/print-agent.js.
@@ -320,7 +349,30 @@ const DEFAULT_CFG = {
   // e ficam salvas aqui — não apague nem troque manualmente, ou as inscrições já feitas param de funcionar.
   vapid: { publicKey: '', privateKeyJwk: null, subject: 'mailto:contato@shogatsu.com.br' },
   // ── Reserva de Mesas ──
-  reservations: { enabled: true, maxPeoplePerTable: 12, note: '' },
+  reservations: {
+    enabled: true, maxPeoplePerTable: 12, note: '',
+    // v126 — NOVO ("botão pra definir que dia/horário está liberado pra reservar"): até aqui
+    // reserva usava o MESMO horário de funcionamento da loja (cfg.weekSchedule) sem nenhuma
+    // forma de diferenciar — uma loja pode querer aceitar reserva só até 21h mesmo abrindo
+    // até 23h (pra não reservar mesa perto do fechamento), ou não aceitar reserva às
+    // segundas mesmo funcionando pra delivery. `useStoreSchedule: true` (padrão) mantém o
+    // comportamento de sempre — usa cfg.weekSchedule normalmente, sem precisar configurar
+    // nada a mais. Desligando, passa a usar o `schedule` próprio abaixo (mesmo formato do
+    // weekSchedule — 7 posições, domingo=0).
+    useStoreSchedule: true,
+    schedule: [
+      { open: true, openTime: '18:00', closeTime: '23:00' },
+      { open: false, openTime: '18:00', closeTime: '23:00' },
+      { open: true, openTime: '18:00', closeTime: '23:00' },
+      { open: true, openTime: '18:00', closeTime: '23:00' },
+      { open: true, openTime: '18:00', closeTime: '23:00' },
+      { open: true, openTime: '18:00', closeTime: '23:00' },
+      { open: true, openTime: '18:00', closeTime: '23:00' }
+    ],
+    // v126 — NOVO: datas específicas fechadas pra reserva (feriado, evento fechado, etc.),
+    // mesmo em dias que normalmente aceitam — formato 'YYYY-MM-DD'.
+    blockedDates: []
+  },
   // ── Agendamento de Pedidos (cliente escolhe um horário futuro pra retirada/entrega) ──
   scheduling: { enabled: true, minMinutesAhead: 60, maxDaysAhead: 7 },
   // ── v47: Splash Screen Premium — sequência de fotos em tela cheia ao abrir o app, com
@@ -424,7 +476,12 @@ ensureVapidKeys();
 
 function readJSON(file) { return JSON.parse(fs.readFileSync(file, 'utf8')); }
 function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  // v125 final: gravação atômica — evita deixar JSON pela metade se o processo cair durante a escrita.
+  const dir = path.dirname(file);
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.tmp`);
+  const payload = JSON.stringify(data, null, 2);
+  fs.writeFileSync(tmp, payload, 'utf8');
+  fs.renameSync(tmp, file);
   syncToSupabase(file, data); // fire-and-forget — nunca trava nem quebra a resposta ao usuário
 }
 
@@ -442,7 +499,7 @@ function writeJSON(file, data) {
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'shogatsu_kv';
-const FILE_TO_KEY = { [ORDERS_FILE]: 'orders', [CONFIG_FILE]: 'config', [CUSTOMERS_FILE]: 'customers', [RESERVATIONS_FILE]: 'reservations', [PUSH_SUBS_FILE]: 'push_subs', [ADMIN_PUSH_SUBS_FILE]: 'admin_push_subs', [SCHEDULED_PUSH_FILE]: 'scheduled_push', [COURIERS_FILE]: 'couriers', [DELETE_LOG_FILE]: 'delete_log', [INGREDIENTES_FILE]: 'ingredientes', [FICHAS_TECNICAS_FILE]: 'fichas_tecnicas', [CUSTOS_CONFIG_FILE]: 'custos_config', [SESSIONS_FILE]: 'sessions', [APROVACOES_IA_FILE]: 'aprovacoes_ia' };
+const FILE_TO_KEY = { [ORDERS_FILE]: 'orders', [CONFIG_FILE]: 'config', [CUSTOMERS_FILE]: 'customers', [RESERVATIONS_FILE]: 'reservations', [PUSH_SUBS_FILE]: 'push_subs', [ADMIN_PUSH_SUBS_FILE]: 'admin_push_subs', [SCHEDULED_PUSH_FILE]: 'scheduled_push', [COURIERS_FILE]: 'couriers', [DELETE_LOG_FILE]: 'delete_log', [PERMISSION_LOG_FILE]: 'permission_log', [INGREDIENTES_FILE]: 'ingredientes', [FICHAS_TECNICAS_FILE]: 'fichas_tecnicas', [CUSTOS_CONFIG_FILE]: 'custos_config', [SESSIONS_FILE]: 'sessions', [APROVACOES_IA_FILE]: 'aprovacoes_ia' };
 
 function supabaseRequest(method, subpath, body) {
   return new Promise((resolve, reject) => {
@@ -654,7 +711,17 @@ function readConfig() {
       ? DEFAULT_CFG.weekSchedule.map((d, i) => ({ ...d, ...(data.cfg.weekSchedule[i] || {}) }))
       : DEFAULT_CFG.weekSchedule,
     vapid: { ...DEFAULT_CFG.vapid, ...(data.cfg.vapid || {}) },
-    reservations: { ...DEFAULT_CFG.reservations, ...(data.cfg.reservations || {}) },
+    reservations: {
+      ...DEFAULT_CFG.reservations, ...(data.cfg.reservations || {}),
+      // v126 — mesmo cuidado do weekSchedule acima: valida item a item (não deixa a tela
+      // salvar um array incompleto/malformado e quebrar a validação de horário depois).
+      schedule: (Array.isArray(data.cfg.reservations && data.cfg.reservations.schedule) && data.cfg.reservations.schedule.length === 7)
+        ? DEFAULT_CFG.reservations.schedule.map((d, i) => ({ ...d, ...(data.cfg.reservations.schedule[i] || {}) }))
+        : DEFAULT_CFG.reservations.schedule,
+      blockedDates: Array.isArray(data.cfg.reservations && data.cfg.reservations.blockedDates)
+        ? data.cfg.reservations.blockedDates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).slice(0, 200)
+        : DEFAULT_CFG.reservations.blockedDates
+    },
     scheduling: { ...DEFAULT_CFG.scheduling, ...(data.cfg.scheduling || {}) },
     rodizioPopular: { ...DEFAULT_CFG.rodizioPopular, ...(data.cfg.rodizioPopular || {}) },
     splash: { ...DEFAULT_CFG.splash, ...(data.cfg.splash || {}), photos: Array.isArray(data.cfg.splash && data.cfg.splash.photos) ? data.cfg.splash.photos : DEFAULT_CFG.splash.photos },
@@ -731,26 +798,281 @@ const ALL_ROLES = ['master', 'admin', 'vendas', ...OPERATIONAL_ROLES];
 // operacionais novos só podem fazer exatamente a transição da função deles — verificado aqui
 // no backend, nunca só na interface (o painel também esconde os botões que a função não usa,
 // mas quem manda é este check; ver "não confiar apenas no frontend" no pedido de auditoria).
+// v107 — SISTEMA DE PERMISSÕES: quem pode mudar um pedido de qual status pra qual. Evoluído na
+// v109 pra consultar hasPermission() em vez de olhar só o "rank" do papel — assim o Master pode
+// customizar isso usuário por usuário (item 20/21 do escopo: dois "caixa" podem ter permissões
+// diferentes). QUEM NÃO TEM UMA PERMISSÃO CUSTOMIZADA fica exatamente como sempre foi (nenhum
+// usuário existente perde acesso com esta atualização) — ver DEFAULT_PERMISSION_TEMPLATES acima.
 function canChangeOrderStatus(session, fromStatus, toStatus) {
   if (!session) return false;
-  if (ROLE_RANK[session.role]) return true; // master/admin/vendas — sem restrição, como sempre
-  if (session.role === 'cozinha') {
-    return (fromStatus === 'novo' && toStatus === 'preparando') || (fromStatus === 'preparando' && toStatus === 'saiu');
+  if (session.role === 'master') return true;
+  if (!hasPermission(session, 'pedidos', 'alterarStatus')) return false;
+  if (toStatus === 'cancelado') return hasPermission(session, 'pedidos', 'cancelar');
+  // Usuário SEM override de permissão (cfg.users[i].permissions não configurado pra "pedidos"):
+  // mantém a régua específica por função que sempre existiu, transição por transição — pra não
+  // mudar o comportamento de quem já opera assim há tempos.
+  const user = findUserBySession(session);
+  const hasCustomPedidos = !!(user && user.permissions && user.permissions.pedidos);
+  if (!hasCustomPedidos) {
+    if (ROLE_RANK[session.role]) return true; // master/admin/vendas — sem restrição, como sempre
+    if (session.role === 'cozinha') {
+      return (fromStatus === 'novo' && toStatus === 'preparando') || (fromStatus === 'preparando' && toStatus === 'saiu');
+    }
+    if (session.role === 'entrega') {
+      return fromStatus === 'saiu' && toStatus === 'entregue';
+    }
+    if (session.role === 'caixa') {
+      return ['preparando', 'saiu', 'entregue', 'cancelado'].includes(toStatus);
+    }
+    return false;
   }
-  if (session.role === 'entrega') {
-    return fromStatus === 'saiu' && toStatus === 'entregue';
-  }
-  if (session.role === 'caixa') {
-    // Caixa recebe, aceita e finaliza — inclusive retirada (preparando → entregue direto,
-    // sem etapa de entrega) — mas não é quem decide "saiu pra entrega" fisicamente nem cancela
-    // sozinho sem motivo (cancelamento passa por 'cancelado', liberado aqui também: caixa lida
-    // com o cliente na hora, é quem normalmente cancela um pedido a pedido do cliente).
-    return ['preparando', 'saiu', 'entregue', 'cancelado'].includes(toStatus);
-  }
-  return false;
+  // Usuário COM permissões customizadas pelo Master pra "pedidos": já passou no check geral de
+  // alterarStatus/cancelar acima — aqui é livre pra qualquer transição que não seja cancelamento
+  // (o Master decidiu dar acesso a "Alterar status" sem granularidade de transição individual;
+  // é a mesma simplicidade que a caixa de seleção do painel oferece).
+  return true;
 }
 
-// ─── Contas de cliente (telefone + senha de 4 dígitos) ───
+// ═══════════════════════════════════════════════════════════
+// v109 — SISTEMA DE PERMISSÕES GRANULARES (Admin Master decide o que cada login pode fazer)
+// ═══════════════════════════════════════════════════════════
+// Catálogo fixo de categorias/ações que existem no sistema — é a partir daqui que o painel
+// desenha as caixinhas de seleção (GET /api/admin/permission-catalog) e é contra ESTA lista que
+// o backend valida qualquer alteração de permissão (não dá pra inventar uma chave nova só
+// mexendo no JSON/localStorage). "role" aqui serve só de ORGANIZAÇÃO/modelo inicial — a permissão
+// real de cada usuário fica em cfg.users[i].permissions, que o MASTER pode customizar campo a
+// campo, mesmo pra dois usuários com a mesma função (ver pedido, item 20/21 do escopo).
+const PERMISSION_CATALOG = {
+  pedidos: { label: '📦 Pedidos', actions: {
+    ver: 'Ver pedidos', criar: 'Criar pedidos', editar: 'Editar pedidos', cancelar: 'Cancelar pedidos',
+    reabrir: 'Reabrir pedidos', alterarStatus: 'Alterar status', imprimir: 'Imprimir pedidos',
+    historico: 'Visualizar histórico'
+  }},
+  cardapio: { label: '🍣 Cardápio', actions: {
+    ver: 'Ver cardápio', criarProduto: 'Criar produto', editarProduto: 'Editar produto',
+    excluirProduto: 'Excluir produto', criarCategoria: 'Criar categoria', editarCategoria: 'Editar categoria',
+    excluirCategoria: 'Excluir categoria', alterarPrecos: 'Alterar preços', gerenciarGrupos: 'Gerenciar grupos/complementos'
+  }},
+  clientes: { label: '👥 Clientes', actions: {
+    ver: 'Ver clientes', criar: 'Criar clientes', editar: 'Editar clientes', excluir: 'Excluir clientes',
+    verHistorico: 'Ver histórico de pedidos'
+  }},
+  alertas: { label: '🔔 Alertas', actions: {
+    ver: 'Ver alertas', configurar: 'Configurar alertas', escolherSons: 'Escolher sons',
+    alterarVolume: 'Alterar volume', configurarAtraso: 'Configurar alerta de atraso',
+    ativarDesativar: 'Ativar/desativar alertas'
+  }},
+  dispositivos: { label: '📱 Dispositivos', actions: {
+    ver: 'Ver dispositivos', conectarCelular: 'Conectar celular', desconectarCelular: 'Desconectar celular',
+    gerenciar: 'Gerenciar dispositivos', configurarAlertasCelular: 'Configurar alertas do celular'
+  }},
+  usuarios: { label: '👤 Usuários', actions: {
+    ver: 'Ver usuários', criar: 'Criar usuários', editar: 'Editar usuários', desativar: 'Desativar usuários',
+    alterarSenhas: 'Alterar senhas', criarFuncoes: 'Criar funções', editarFuncoes: 'Editar funções',
+    gerenciarPermissoes: 'Gerenciar permissões'
+  }},
+  relatorios: { label: '📊 Relatórios', actions: {
+    ver: 'Ver relatórios', exportar: 'Exportar relatórios', financeiros: 'Relatórios financeiros',
+    pedidos: 'Relatórios de pedidos'
+  }},
+  notificacoes: { label: '📢 Notificações', actions: {
+    criar: 'Criar notificações', editar: 'Editar notificações', enviar: 'Enviar notificações',
+    gerenciarInscritos: 'Gerenciar inscritos'
+  }},
+  restaurante: { label: '🏪 Restaurante', actions: {
+    verConfig: 'Ver configuração', editarInformacoes: 'Editar informações', editarHorarios: 'Editar horários',
+    configurarEntrega: 'Configurar entrega', configurarSetores: 'Configurar setores', configurarImpressoras: 'Configurar impressoras'
+  }},
+  sistema: { label: '⚙️ Sistema', actions: {
+    configuracoesGerais: 'Configurações gerais', logs: 'Logs', configuracoesAvancadas: 'Configurações avançadas'
+  }}
+};
+// Gera um template "tudo true" ou "tudo false" a partir do catálogo — usado tanto pros
+// padrões por função quanto pra validar/limpar o que chega de fora em PATCH .../permissions
+// (nunca aceitamos uma chave que não exista no catálogo, nem categoria/ação inventada).
+function fullPermTemplate(value) {
+  const out = {};
+  for (const cat of Object.keys(PERMISSION_CATALOG)) {
+    out[cat] = {};
+    for (const act of Object.keys(PERMISSION_CATALOG[cat].actions)) out[cat][act] = value;
+  }
+  return out;
+}
+// Padrão por FUNÇÃO — é só o que cada função recebe quando o Master NÃO customizou nada pra
+// aquele usuário específico (comportamento de sempre, pra ninguém que já usa o sistema hoje
+// perder acesso de uma hora pra outra). O Master pode sobrescrever qualquer uma dessas caixinhas
+// por usuário em Usuários → 🔐 Configurar Permissões — a partir daí, o valor customizado manda,
+// não o padrão da função.
+const DEFAULT_PERMISSION_TEMPLATES = {
+  admin: fullPermTemplate(true), // admin sempre teve acesso a tudo que não é exclusivo de master
+  vendas: (() => {
+    const t = fullPermTemplate(false);
+    Object.keys(t.pedidos).forEach(k => { t.pedidos[k] = true; }); // vendas sempre pôde mexer em pedido à vontade
+    t.clientes.ver = true; // /api/admin/customer-lookup já liberava pra vendas
+    return t;
+  })(),
+  caixa: (() => {
+    const t = fullPermTemplate(false);
+    Object.assign(t.pedidos, { ver: true, criar: true, imprimir: true, historico: true, alterarStatus: true, cancelar: true });
+    return t;
+  })(),
+  cozinha: (() => {
+    const t = fullPermTemplate(false);
+    Object.assign(t.pedidos, { ver: true, alterarStatus: true, imprimir: true });
+    return t;
+  })(),
+  entrega: (() => {
+    const t = fullPermTemplate(false);
+    Object.assign(t.pedidos, { ver: true, alterarStatus: true });
+    return t;
+  })(),
+  _default: fullPermTemplate(false) // função desconhecida/personalizada sem nada configurado: nega tudo (seguro por padrão)
+};
+// Devolve o usuário completo (cfg.users[i]) pela sessão — é daqui que hasPermission() lê o
+// override individual, se existir.
+function findUserBySession(session) {
+  if (!session) return null;
+  const { cfg } = readConfig();
+  return (cfg.users || []).find(u => String(u.username || '').toLowerCase() === String(session.username || '').toLowerCase()) || null;
+}
+// hasPermission(): master NUNCA passa por aqui (é superusuário por definição, item 18 do
+// escopo — não existe caixinha que tire acesso do master). Pra qualquer outro papel: se o
+// usuário tem uma permissão CUSTOMIZADA pelo Master pra essa categoria/ação específica, ela
+// manda; senão, cai no padrão da função (DEFAULT_PERMISSION_TEMPLATES). Como isso é lido do
+// arquivo a cada chamada (nunca fica "gravado" no token/sessão), uma alteração de permissão
+// feita pelo Master vale JÁ NA PRÓXIMA REQUISIÇÃO daquele usuário — sem precisar deslogar
+// ninguém (item 24 do escopo).
+function hasPermission(session, category, action) {
+  if (!session) return false;
+  if (session.role === 'master') return true;
+  if (!PERMISSION_CATALOG[category] || !PERMISSION_CATALOG[category].actions[action]) return false; // categoria/ação inexistente
+  const user = findUserBySession(session);
+  if (user && user.active === false) return false; // usuário desativado nunca tem permissão nenhuma
+  if (user && user.permissions && user.permissions[category] && Object.prototype.hasOwnProperty.call(user.permissions[category], action)) {
+    return !!user.permissions[category][action];
+  }
+  const template = DEFAULT_PERMISSION_TEMPLATES[session.role] || DEFAULT_PERMISSION_TEMPLATES._default;
+  return !!(template[category] && template[category][action]);
+}
+function requirePermission(token, category, action) {
+  return hasPermission(getSession(token), category, action);
+}
+// Devolve o conjunto de permissões EFETIVAS de uma sessão (customizada + padrão da função,
+// já resolvidas) — mandado pro frontend no login pra ele saber o que mostrar/esconder sem
+// precisar reimplementar essa lógica em JS (a decisão de verdade continua sendo sempre
+// re-checada no backend em cada rota; isso aqui é só pra experiência da interface).
+function effectivePermissions(session) {
+  if (!session) return fullPermTemplate(false);
+  if (session.role === 'master') return fullPermTemplate(true);
+  const out = {};
+  for (const cat of Object.keys(PERMISSION_CATALOG)) {
+    out[cat] = {};
+    for (const act of Object.keys(PERMISSION_CATALOG[cat].actions)) out[cat][act] = hasPermission(session, cat, act);
+  }
+  return out;
+}
+// ── Gerenciamento de USUÁRIOS: quem pode mexer em quem ──
+// Regra do item 18/25/30: usuário comum NUNCA pode virar master, alterar o master, conceder
+// permissão que não possui, ou se autoconceder algo. Só o próprio master é 100% livre aqui.
+function canManageUsers(session, action) {
+  if (!session) return false;
+  if (session.role === 'master') return true;
+  return hasPermission(session, 'usuarios', action || 'ver');
+}
+// targetUser = usuário que está sendo criado/editado; actingSession = quem está fazendo a ação.
+// Retorna null se pode prosseguir, ou uma string com o motivo do bloqueio.
+function guardUserMutation(actingSession, targetUser, proposedRole, proposedPermissions) {
+  if (actingSession.role === 'master') return null; // master pode tudo, sem exceção
+  if (targetUser && targetUser.role === 'master') return 'Só o usuário master pode alterar outro master.';
+  if (proposedRole === 'master') return 'Só o usuário master pode conceder o nível master.';
+  if (String(targetUser && targetUser.username || '').toLowerCase() === String(actingSession.username || '').toLowerCase()) {
+    return 'Você não pode alterar suas próprias permissões.';
+  }
+  // Ninguém pode conceder a outro uma permissão que ELE MESMO não tem (item 25/31: "nenhum
+  // usuário pode conceder a si mesmo ou a terceiros uma permissão que não possui").
+  if (proposedPermissions) {
+    for (const cat of Object.keys(PERMISSION_CATALOG)) {
+      for (const act of Object.keys(PERMISSION_CATALOG[cat].actions)) {
+        const wants = proposedPermissions[cat] && proposedPermissions[cat][act];
+        if (wants && !hasPermission(actingSession, cat, act)) {
+          return `Você não pode conceder a permissão "${PERMISSION_CATALOG[cat].actions[act]}" (${PERMISSION_CATALOG[cat].label}) porque você mesmo não tem essa permissão.`;
+        }
+      }
+    }
+  }
+  return null;
+}
+// Sanitiza um objeto de permissões vindo de fora: só aceita as chaves que existem de verdade
+// no catálogo, forçando tudo o mais pra boolean — nunca deixa passar campo desconhecido.
+function sanitizePermissions(input) {
+  if (!input || typeof input !== 'object') return undefined;
+  const out = {};
+  for (const cat of Object.keys(PERMISSION_CATALOG)) {
+    if (!input[cat] || typeof input[cat] !== 'object') continue;
+    out[cat] = {};
+    for (const act of Object.keys(PERMISSION_CATALOG[cat].actions)) {
+      if (Object.prototype.hasOwnProperty.call(input[cat], act)) out[cat][act] = !!input[cat][act];
+    }
+  }
+  return out;
+}
+// ── Histórico de alterações de permissão (item 29) — nunca grava senha, só quem/o quê/quando ──
+function logPermissionChange(actorUsername, targetUsername, changes) {
+  try {
+    const log = readJSON(PERMISSION_LOG_FILE);
+    log.unshift({ id: 'permlog_' + Date.now().toString(36), actor: actorUsername, target: targetUsername, changes, at: new Date().toISOString() });
+    writeJSON(PERMISSION_LOG_FILE, log.slice(0, 1000));
+  } catch (e) { /* nunca derruba a requisição principal por causa do log */ }
+}
+// Compara duas permissões (antes/depois) e devolve só o que mudou de verdade, em texto —
+// usado pelo histórico (item 29: "Removeu: X / Adicionou: Y").
+function diffPermissions(before, after) {
+  const added = [], removed = [];
+  for (const cat of Object.keys(PERMISSION_CATALOG)) {
+    for (const act of Object.keys(PERMISSION_CATALOG[cat].actions)) {
+      const b = !!(before && before[cat] && before[cat][act]);
+      const a = !!(after && after[cat] && after[cat][act]);
+      if (a && !b) added.push(`${PERMISSION_CATALOG[cat].label} · ${PERMISSION_CATALOG[cat].actions[act]}`);
+      if (b && !a) removed.push(`${PERMISSION_CATALOG[cat].label} · ${PERMISSION_CATALOG[cat].actions[act]}`);
+    }
+  }
+  return { added, removed };
+}
+// ── POST /api/config: endpoint único que salva cardápio + config da loja juntos (histórico do
+// projeto). Pra não travar em quem só tem permissão parcial (ex: só "editar horários", sem
+// poder mexer no cardápio), a checagem olha quais campos vieram no corpo da requisição e exige
+// só a permissão correspondente àquele pedaço — se o usuário mandar campos de mais de uma
+// categoria, precisa ter permissão pra CADA uma delas que aparece no corpo.
+function configWritePermissionCheck(session, body) {
+  if (!session) return 'unauthorized';
+  if (session.role === 'master') return null;
+  const c = body.cfg || {};
+  const need = [];
+  if (body.menu !== undefined || body.categories !== undefined) {
+    const any = ['criarProduto', 'editarProduto', 'excluirProduto', 'criarCategoria', 'editarCategoria', 'excluirCategoria', 'alterarPrecos']
+      .some(act => hasPermission(session, 'cardapio', act));
+    if (!any) need.push('Cardápio');
+  }
+  if (c.lateAlert !== undefined || c.newOrderRing !== undefined || c.sound !== undefined || c.customerAlertSound !== undefined) {
+    if (!hasPermission(session, 'alertas', 'configurar')) need.push('Alertas');
+  }
+  if (c.fee !== undefined || c.deliveryMode !== undefined || c.deliveryRadius !== undefined || c.deliveryZones !== undefined) {
+    if (!hasPermission(session, 'restaurante', 'configurarEntrega')) need.push('Entrega');
+  }
+  if (c.stations !== undefined || c.printSize !== undefined || c.printFont !== undefined) {
+    if (!hasPermission(session, 'restaurante', 'configurarImpressoras')) need.push('Impressoras');
+  }
+  if (c.schedule !== undefined || c.weekSchedule !== undefined || c.hours !== undefined) {
+    if (!hasPermission(session, 'restaurante', 'editarHorarios')) need.push('Horários');
+  }
+  const genericFields = ['whats', 'storePhone', 'name', 'addr', 'days', 'logoUrl', 'min', 'time', 'timeRetirada'];
+  if (genericFields.some(f => c[f] !== undefined)) {
+    if (!hasPermission(session, 'restaurante', 'editarInformacoes')) need.push('Informações da loja');
+  }
+  return need.length ? `Seu usuário não tem permissão pra alterar: ${need.join(', ')}.` : null;
+}
+
+
 // Mantém só dígitos no telefone, pra "22999991234" e "(22) 99999-1234" serem o mesmo cliente.
 function normalizePhone(phone) { return String(phone || '').replace(/\D/g, ''); }
 
@@ -824,7 +1146,7 @@ function broadcast(event, data) {
 // quando os arquivos do sistema são atualizados; precisa de REINICIAR-AGENTE.bat. Atualizar esse
 // valor sempre que print-agent.js mudar de verdade (não precisa mudar em toda alteração de
 // server.js — só quando o AGENT_BUILD de lá também mudar).
-const CURRENT_AGENT_BUILD = 'v95';
+const CURRENT_AGENT_BUILD = 'v125-part2';
 const printAgents = new Map(); // agentId -> { label, stations, printers, build, lastSeen }
 const PRINT_AGENT_TTL_MS = 90 * 1000; // sem novo aviso em 90s, considera o agente offline
 function getOnlinePrintAgents() {
@@ -1628,12 +1950,35 @@ function sugerirNovoProdutoIA(iaCfg, cfg, menu, ingredientes, tema) {
 // Comandos ESC/POS básicos
 const ESC = {
   init: '\x1B\x40',
+  // v129 — BUG CORRIGIDO ("erro de encoding, caracteres ã ç é ê ó"): a impressão direta
+  // (USB/rede, sem Agente Local) nunca mandava pra impressora QUAL código de página usar pra
+  // interpretar os bytes de acento — o texto sai codificado em Latin-1/Windows-1252 (é o que
+  // `Buffer.from(text,'binary')` produz lá embaixo em sendUSBPrint/sendNetworkPrint), mas sem
+  // esse comando a impressora fica no código de página que ela trouxer de fábrica (geralmente
+  // PC437, que não tem os acentos do português nesses mesmos bytes — sai símbolo errado). O
+  // Agente Local (print-agent.js) já resolve isso corretamente há tempos, com a biblioteca
+  // convertendo pra PC860 Português (ver characterSet em buildPrinter) — só faltava esse
+  // mesmo cuidado no caminho direto do servidor. ESC t 16 seleciona WPC1252 (Windows-1252),
+  // compatível com os bytes que já geramos.
+  codepage: '\x1B\x74\x10',
   boldOn: '\x1B\x45\x01', boldOff: '\x1B\x45\x00',
   center: '\x1B\x61\x01', left: '\x1B\x61\x00',
   doubleOn: '\x1D\x21\x11', doubleOff: '\x1D\x21\x00',
   cut: '\x1D\x56\x01',
+  // v126 — NOVO ("fazer um bip duplo ao imprimir"): comando ESC/POS padrão de campainha
+  // (ESC B n t = apita "n" vezes, cada apito com duração "t"×100ms) — suportado pela grande
+  // maioria das térmicas em modo ESC/POS, incluindo Bematech em modo de emulação ESC/POS.
+  // n=2 já dá o bipe duplo pedido numa única comanda; se a impressora não tiver campainha
+  // (ou estiver desligada no hardware), o comando é simplesmente ignorado, sem erro nenhum.
+  beep: '\x1B\x42\x02\x02',
   feed: '\n\n\n'
 };
+// v126 — NOVO: quantas colunas de texto usar pra alinhar valores à direita e desenhar as
+// linhas tracejadas na impressão direta (USB/rede sem Agente Local) — depende da largura
+// real da bobina configurada em cfg.printWidth (ver default acima). 80mm comporta bem mais
+// texto por linha que 58mm; usar sempre 32 (tamanho de 58mm) deixava uma bobina de 80mm com
+// metade da largura sobrando sem uso nenhum.
+function printCols(cfg) { return (cfg && cfg.printWidth === '58mm') ? 32 : 48; }
 
 // v84 — BUG CORRIGIDO ("cliente marca opção de pagamento deve aparecer como pagamento na
 // entrega"): PIX é pago ANTES (pelo gateway/confirmação manual), mas dinheiro/crédito/débito
@@ -1667,19 +2012,29 @@ function tamanhoImpressaoTermica(printSize) {
   else if (s >= 18) { alturaMult = 1; }                   // altura 2x, largura normal (era o único "grande" antes)
   // abaixo de 18 (10 a 17): tamanho padrão da impressora — térmica não imprime menor que isso
   const n = (larguraMult << 4) | alturaMult;
-  return { on: '\x1D\x21' + String.fromCharCode(n), off: ESC.doubleOff };
+  // v128 — NOVO ("nome do item deve ser maior e em negrito"): variante "wide" — mesma altura
+  // configurada (alturaMult), largura +1 nível (até o teto de 7 que o comando ESC/POS aceita)
+  // — usada só no NOME do item nas vias de produção (ver buildTicketText/uso abaixo). Nunca
+  // usa ESC.doubleOff (reset pra ZERO) pra voltar — sempre volta pro `on` normal configurado,
+  // senão perderia o tamanho escolhido pelo lojista pro resto do ticket depois do nome.
+  const nWide = (Math.min(larguraMult + 1, 7) << 4) | alturaMult;
+  return { on: '\x1D\x21' + String.fromCharCode(n), off: ESC.doubleOff, wideOn: '\x1D\x21' + String.fromCharCode(nWide) };
 }
 function buildTicketText(lines, cfg) {
   const tam = tamanhoImpressaoTermica(cfg && cfg.printSize);
   const body = tam.on + lines.join('\n') + tam.off;
-  return ESC.init + body + ESC.feed + ESC.cut;
+  // v126 — bipe duplo ao final de toda impressão direta (USB/rede), depois do corte —
+  // avisa quem está no balcão/cozinha que saiu uma comanda nova sem precisar olhar pra
+  // impressora o tempo todo.
+  return ESC.init + ESC.codepage + body + ESC.feed + ESC.cut + ESC.beep;
 }
 
 // v93 — via de RESERVA DE MESA (impressora de rede/USB direta). Mesma ideia/layout das vias de
 // pedido (buildTicketText acima), só que com os dados da reserva em vez do carrinho.
 function buildReservationTicketText(reservation, cfg) {
-  const HR = '--------------------------------';
-  const HR2 = '================================';
+  const cols = printCols(cfg);
+  const HR = '-'.repeat(cols);
+  const HR2 = '='.repeat(cols);
   const lines = [];
   lines.push(ESC.center + ESC.boldOn + (cfg.name || 'SHOGATSU').toUpperCase() + ESC.boldOff);
   lines.push((cfg.tagline || 'CULINARIA ORIENTAL').toUpperCase() + ESC.left);
@@ -1701,7 +2056,7 @@ function buildReservationTicketText(reservation, cfg) {
   lines.push('Pessoas: ' + reservation.people);
   if (reservation.notes) { lines.push(HR); lines.push('Obs: ' + reservation.notes); }
   lines.push(HR2);
-  lines.push(ESC.center + 'Reservado em ' + new Date(reservation.createdAt).toLocaleString('pt-BR') + ESC.left);
+  lines.push(ESC.center + 'Reservado em ' + new Date(reservation.createdAt).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }) + ESC.left);
   return buildTicketText(lines, cfg);
 }
 
@@ -1719,9 +2074,28 @@ function sendNetworkPrint(ip, port, text) {
 
 // Envia para um dispositivo USB local (ex: /dev/usb/lp0) — só funciona quando o
 // servidor roda na mesma máquina física conectada à impressora (ex: Raspberry Pi/PC local).
+// v128 — BUG CORRIGIDO ("imprimir várias vias na cozinha trava o sistema"): fs.writeFile
+// NÃO TEM TIMEOUT NENHUM por padrão — se a impressora USB estivesse travada, offline, sem
+// papel de um jeito que trava o buffer, ou o cabo desconectado bem na hora, essa escrita
+// podia ficar PENDURADA PRA SEMPRE, nunca resolvendo nem rejeitando. Como as vias diretas
+// (USB/rede) são todas enviadas juntas num Promise.all (ver /api/print no painel.html, pra
+// imprimir tudo ao mesmo tempo em vez de esperar via por via), UMA impressora USB travada
+// travava a impressão de TODAS as vias do pedido — inclusive vias que estavam funcionando
+// perfeitamente (ex.: a cozinha ficava esperando pra sempre por causa de uma impressora de
+// sushibar travada, ou vice-versa). Agora tem um teto de 8 segundos: se a escrita não
+// terminar até lá, rejeita com um erro claro em vez de travar o pedido inteiro.
 function sendUSBPrint(devicePath, text) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`Impressora USB (${devicePath}) não respondeu em 8s — pode estar travada, offline ou sem papel. As outras vias não foram afetadas.`));
+    }, 8000);
     fs.writeFile(devicePath, Buffer.from(text, 'binary'), (err) => {
+      if (settled) return; // já estourou o timeout — ignora essa resposta tardia
+      settled = true;
+      clearTimeout(timer);
       if (err) return reject(err);
       resolve(true);
     });
@@ -1926,6 +2300,16 @@ async function handleRequest(req, res) {
   const pathname = parsed.pathname;
   const query = Object.fromEntries(parsed.searchParams);
 
+  // v123 — admin-cardapio.html foi removido por ser apenas um atalho duplicado.
+  // Mantemos a URL antiga funcionando para não quebrar favoritos/links antigos.
+  if (pathname === '/admin-cardapio.html' && (req.method === 'GET' || req.method === 'HEAD')) {
+    res.writeHead(301, {
+      'Location': '/painel.html#cardapio',
+      'Cache-Control': 'no-store'
+    });
+    return res.end();
+  }
+
   if (req.method === 'OPTIONS') { return sendJSON(res, 204, {}); }
 
   // ── GET /api/version — usado pelo front-end (public/version-check.js) pra saber se existe
@@ -1948,9 +2332,12 @@ async function handleRequest(req, res) {
 
   // ── POST /api/config — admin salva config/cardápio ──
   if (pathname === '/api/config' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar configurações/cardápio.' });
+    const _cfgSession = getSession(getToken(req, query));
+    if (!_cfgSession) return sendJSON(res, 401, { error: 'unauthorized' });
     try {
       const body = await readBody(req);
+      const _permErr = configWritePermissionCheck(_cfgSession, body);
+      if (_permErr) return sendJSON(res, 403, { error: _permErr });
       const current = readConfig();
       // v49 — BUG CORRIGIDO ("excluir estação não excluía de verdade"): o merge antigo só
       // ACRESCENTAVA chaves em cfg.stations (spread de current + spread do que veio no body),
@@ -1986,6 +2373,19 @@ async function handleRequest(req, res) {
           weekSchedule: (Array.isArray(body.cfg && body.cfg.weekSchedule) && body.cfg.weekSchedule.length === 7)
             ? current.cfg.weekSchedule.map((d, i) => ({ ...d, ...(body.cfg.weekSchedule[i] || {}) }))
             : current.cfg.weekSchedule,
+          // v126 — NOVO: mesma validação cuidadosa do weekSchedule acima, aplicada ao horário
+          // próprio de reserva (Configurações → 📅 Disponibilidade de Reserva) — protege
+          // contra salvar um array incompleto/malformado que quebraria a validação de
+          // horário nas próximas reservas.
+          reservations: {
+            ...current.cfg.reservations, ...(body.cfg && body.cfg.reservations || {}),
+            schedule: (Array.isArray(body.cfg && body.cfg.reservations && body.cfg.reservations.schedule) && body.cfg.reservations.schedule.length === 7)
+              ? current.cfg.reservations.schedule.map((d, i) => ({ ...d, ...(body.cfg.reservations.schedule[i] || {}) }))
+              : current.cfg.reservations.schedule,
+            blockedDates: Array.isArray(body.cfg && body.cfg.reservations && body.cfg.reservations.blockedDates)
+              ? body.cfg.reservations.blockedDates.filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d)).slice(0, 200)
+              : current.cfg.reservations.blockedDates
+          },
           rodizioPopular: { ...current.cfg.rodizioPopular, ...(body.cfg && body.cfg.rodizioPopular || {}) },
           installPromo: { ...current.cfg.installPromo, ...(body.cfg && body.cfg.installPromo || {}) },
           splash: {
@@ -2035,7 +2435,7 @@ async function handleRequest(req, res) {
   // precisar redigitar tudo de novo. Primeiro tenta o cadastro (customers.json); se o cliente
   // nunca criou conta mas já tem pedido anterior, usa os dados do pedido mais recente dele. ──
   if (pathname === '/api/admin/customer-lookup' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'vendas')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'clientes', 'ver')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const phone = normalizePhone(query.phone || '');
     if (!phone) return sendJSON(res, 200, { found: false });
     const customers = readJSON(CUSTOMERS_FILE);
@@ -2053,7 +2453,7 @@ async function handleRequest(req, res) {
 
   // ── GET /api/admin/customers — lista clientes cadastrados com estatísticas (painel, promoções por SMS) ──
   if (pathname === '/api/admin/customers' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os clientes.' });
+    if (!requirePermission(getToken(req, query), 'clientes', 'ver')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os clientes.' });
     const { cfg } = readConfig();
     const customers = readJSON(CUSTOMERS_FILE);
     const orders = readJSON(ORDERS_FILE);
@@ -2068,7 +2468,7 @@ async function handleRequest(req, res) {
 
 
   if (pathname === '/api/admin/send-promo-sms' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra enviar SMS.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'enviar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra enviar SMS.' });
     try {
       const { phones, message } = await readBody(req);
       const { cfg } = readConfig();
@@ -2095,12 +2495,12 @@ async function handleRequest(req, res) {
     return d.length >= 10 ? d.slice(0, 2) : '??';
   }
   if (pathname === '/api/admin/contatos' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'clientes', 'ver')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const lista = readJSON(CONTATOS_IMPORTADOS_FILE, []);
     return sendJSON(res, 200, { contatos: lista });
   }
   if (pathname === '/api/admin/contatos/importar' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'clientes', 'criar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const body = await readBody(req);
       const recebidos = Array.isArray(body.contatos) ? body.contatos.slice(0, 5000) : [];
@@ -2128,7 +2528,7 @@ async function handleRequest(req, res) {
   }
   const contatoMatch = pathname.match(/^\/api\/admin\/contatos\/([^/]+)$/);
   if (contatoMatch && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'clientes', 'excluir')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     let lista = readJSON(CONTATOS_IMPORTADOS_FILE, []);
     const antes = lista.length;
     lista = lista.filter(c => c.id !== contatoMatch[1]);
@@ -2141,7 +2541,7 @@ async function handleRequest(req, res) {
   // do mesmo jeito que senhas nunca voltam pro painel. Ficam fora do fluxo normal de /api/config
   // de propósito, pra a chave nunca correr o risco de ser reenviada em branco num "Salvar Tudo".
   if (pathname === '/api/ia/settings' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'sistema', 'configuracoesAvancadas')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const { cfg } = readConfig();
     return sendJSON(res, 200, {
       enabled: !!cfg.ia.enabled, hasKey: !!cfg.ia.apiKey, provider: cfg.ia.provider || 'groq',
@@ -2156,7 +2556,7 @@ async function handleRequest(req, res) {
     });
   }
   if (pathname === '/api/ia/settings' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'sistema', 'configuracoesAvancadas')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const body = await readBody(req);
       const data = readConfig();
@@ -2406,7 +2806,7 @@ async function handleRequest(req, res) {
   // uma conversa nova do zero (o servidor responde 404 pra esse id antigo). ──
   const conversaDeleteMatch = pathname.match(/^\/api\/admin\/atendimento\/([a-f0-9]+)$/);
   if (conversaDeleteMatch && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra excluir conversas.' });
+    if (!requirePermission(getToken(req, query), 'sistema', 'configuracoesAvancadas')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra excluir conversas.' });
     const todas = lerAtendimentos();
     if (!todas[conversaDeleteMatch[1]]) return sendJSON(res, 404, { error: 'Conversa não encontrada.' });
     delete todas[conversaDeleteMatch[1]];
@@ -2474,43 +2874,125 @@ async function handleRequest(req, res) {
   }
 
 
+  // v109: GET /api/admin/users agora devolve também active/permissions (só quem tem
+  // 'usuarios'.'ver' - master sempre tem). Senha (hash) nunca é incluída na resposta.
   if (pathname === '/api/admin/users' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'master')) return sendJSON(res, 403, { error: 'Só o usuário master pode gerenciar usuários.' });
+    if (!canManageUsers(getSession(getToken(req, query)), 'ver')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os usuários.' });
     const { cfg } = readConfig();
-    return sendJSON(res, 200, { users: (cfg.users || []).map(u => ({ username: u.username, role: u.role })) });
+    return sendJSON(res, 200, { users: (cfg.users || []).map(u => ({ username: u.username, displayName: u.displayName || '', role: u.role, active: u.active !== false, permissions: u.permissions || null })) });
   }
   if (pathname === '/api/admin/users' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'master')) return sendJSON(res, 403, { error: 'Só o usuário master pode gerenciar usuários.' });
+    const actingSession = getSession(getToken(req, query));
+    const action = 'criar'; // POST cobre criação e edição — a checagem específica de "editar" roda abaixo, se for o caso
+    if (!canManageUsers(actingSession, action) && !canManageUsers(actingSession, 'editar')) {
+      return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra gerenciar usuários.' });
+    }
     try {
-      const { username, password, role } = await readBody(req);
+      const { username, password, role, permissions, displayName } = await readBody(req);
       const uname = String(username || '').trim().toLowerCase();
       if (!uname || uname.length < 3) return sendJSON(res, 400, { error: 'Usuário precisa ter pelo menos 3 caracteres.' });
       if (!ALL_ROLES.includes(role)) return sendJSON(res, 400, { error: 'Nível de acesso inválido.' });
       const data = readConfig();
       const existing = data.cfg.users.find(u => String(u.username || '').toLowerCase() === uname);
+      const cleanPerms = sanitizePermissions(permissions);
+      const guardMsg = guardUserMutation(actingSession, existing, role, cleanPerms);
+      if (guardMsg) return sendJSON(res, 403, { error: guardMsg });
+      const before = existing ? JSON.parse(JSON.stringify(existing.permissions || {})) : {};
       if (existing) {
+        if (!canManageUsers(actingSession, 'editar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra editar usuários.' });
         existing.role = role;
-        if (password) { existing.passwordHash = hashUserPassword(uname, password); delete existing.password; } // só troca a senha se veio uma nova; nunca mais grava texto puro
+        if (displayName !== undefined) existing.displayName = String(displayName || '').trim().slice(0, 60);
+        if (password) {
+          if (!canManageUsers(actingSession, 'alterarSenhas')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar senhas.' });
+          existing.passwordHash = hashUserPassword(uname, password); delete existing.password;
+        }
+        if (cleanPerms !== undefined) existing.permissions = cleanPerms;
       } else {
+        if (!canManageUsers(actingSession, 'criar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra criar usuários.' });
         if (!password || password.length < 4) return sendJSON(res, 400, { error: 'Senha precisa ter pelo menos 4 caracteres.' });
-        data.cfg.users.push({ username: uname, passwordHash: hashUserPassword(uname, password), role });
+        data.cfg.users.push({ username: uname, displayName: String(displayName || '').trim().slice(0, 60), passwordHash: hashUserPassword(uname, password), role, active: true, permissions: cleanPerms || undefined });
       }
       writeJSON(CONFIG_FILE, data);
-      return sendJSON(res, 200, { ok: true, users: data.cfg.users.map(u => ({ username: u.username, role: u.role })) });
+      const after = existing ? existing.permissions || {} : (cleanPerms || {});
+      const { added, removed } = diffPermissions(before, after);
+      if (added.length || removed.length || !existing) {
+        logPermissionChange(actingSession.username, uname, existing ? { added, removed } : { criado: true, role });
+      }
+      return sendJSON(res, 200, { ok: true, users: data.cfg.users.map(u => ({ username: u.username, displayName: u.displayName || '', role: u.role, active: u.active !== false, permissions: u.permissions || null })) });
+    } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
+  }
+  // v109: PATCH /api/admin/users/:username/permissions — edita SÓ as permissões (sem mexer em
+  // senha/role), com todas as travas de segurança do item 25/31 do escopo (ninguém concede o
+  // que não tem, master é intocável por terceiros, ninguém mexe na própria permissão).
+  if (pathname.match(/^\/api\/admin\/users\/[^/]+\/permissions$/) && req.method === 'PATCH') {
+    const actingSession = getSession(getToken(req, query));
+    if (!canManageUsers(actingSession, 'gerenciarPermissoes')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra gerenciar permissões.' });
+    const uname = decodeURIComponent(pathname.split('/')[4] || '').toLowerCase();
+    try {
+      const { permissions } = await readBody(req);
+      const cleanPerms = sanitizePermissions(permissions) || {};
+      const data = readConfig();
+      const target = data.cfg.users.find(u => String(u.username || '').toLowerCase() === uname);
+      if (!target) return sendJSON(res, 404, { error: 'Usuário não encontrado.' });
+      const guardMsg = guardUserMutation(actingSession, target, target.role, cleanPerms);
+      if (guardMsg) return sendJSON(res, 403, { error: guardMsg });
+      const before = JSON.parse(JSON.stringify(target.permissions || {}));
+      target.permissions = cleanPerms;
+      writeJSON(CONFIG_FILE, data);
+      const { added, removed } = diffPermissions(before, cleanPerms);
+      logPermissionChange(actingSession.username, uname, { added, removed });
+      return sendJSON(res, 200, { ok: true, permissions: target.permissions, added, removed });
+    } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
+  }
+  // v109: POST /api/admin/users/:username/active — ativa/desativa um login (item 19 "Status" +
+  // item 30 "usuário desativado → login bloqueado"). Usuário desativado não passa mais no login
+  // (ver POST /api/login) e hasPermission() nega tudo pra ele mesmo com token antigo ainda válido.
+  if (pathname.match(/^\/api\/admin\/users\/[^/]+\/active$/) && req.method === 'POST') {
+    const actingSession = getSession(getToken(req, query));
+    if (!canManageUsers(actingSession, 'desativar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ativar/desativar usuários.' });
+    const uname = decodeURIComponent(pathname.split('/')[4] || '').toLowerCase();
+    try {
+      const { active } = await readBody(req);
+      const data = readConfig();
+      const target = data.cfg.users.find(u => String(u.username || '').toLowerCase() === uname);
+      if (!target) return sendJSON(res, 404, { error: 'Usuário não encontrado.' });
+      const guardMsg = guardUserMutation(actingSession, target, target.role, null);
+      if (guardMsg) return sendJSON(res, 403, { error: guardMsg });
+      if (target.role === 'master' && active === false) return sendJSON(res, 400, { error: 'Não dá pra desativar um usuário master.' });
+      target.active = !!active;
+      writeJSON(CONFIG_FILE, data);
+      logPermissionChange(actingSession.username, uname, active ? { reativado: true } : { desativado: true });
+      return sendJSON(res, 200, { ok: true, active: target.active });
     } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
   }
   if (pathname.startsWith('/api/admin/users/') && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'master')) return sendJSON(res, 403, { error: 'Só o usuário master pode gerenciar usuários.' });
+    const actingSession = getSession(getToken(req, query));
+    if (!canManageUsers(actingSession, 'desativar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra remover usuários.' });
     const uname = decodeURIComponent(pathname.split('/').pop() || '').toLowerCase();
     const data = readConfig();
     const target = data.cfg.users.find(u => String(u.username || '').toLowerCase() === uname);
     if (!target) return sendJSON(res, 404, { error: 'Usuário não encontrado.' });
+    const guardMsg = guardUserMutation(actingSession, target, target.role, null);
+    if (guardMsg) return sendJSON(res, 403, { error: guardMsg });
     if (target.role === 'master' && data.cfg.users.filter(u => u.role === 'master').length <= 1) {
       return sendJSON(res, 400, { error: 'Precisa existir pelo menos um usuário master.' });
     }
     data.cfg.users = data.cfg.users.filter(u => String(u.username || '').toLowerCase() !== uname);
     writeJSON(CONFIG_FILE, data);
+    logPermissionChange(actingSession.username, uname, { removido: true });
     return sendJSON(res, 200, { ok: true });
+  }
+  // v109: GET /api/admin/permission-catalog — catálogo de categorias/ações (é a partir daqui
+  // que o painel desenha as caixinhas; nunca fica hardcoded duas vezes/dessincronizado).
+  if (pathname === '/api/admin/permission-catalog' && req.method === 'GET') {
+    if (!checkAuth(getToken(req, query))) return sendJSON(res, 401, { error: 'unauthorized' });
+    return sendJSON(res, 200, { catalog: PERMISSION_CATALOG, roles: ALL_ROLES, templates: DEFAULT_PERMISSION_TEMPLATES });
+  }
+  // v109: GET /api/admin/permission-log — histórico de alterações (item 29). Só quem gerencia
+  // usuários enxerga (nunca inclui senha, só quem/o quê/quando).
+  if (pathname === '/api/admin/permission-log' && req.method === 'GET') {
+    if (!canManageUsers(getSession(getToken(req, query)), 'ver')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    return sendJSON(res, 200, { log: readJSON(PERMISSION_LOG_FILE).slice(0, 200) });
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -2519,12 +3001,12 @@ async function handleRequest(req, res) {
   // ═══════════════════════════════════════════════════════════
   // ── GET /api/admin/couriers — lista motoboys cadastrados ──
   if (pathname === '/api/admin/couriers' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os motoboys.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarSetores')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os motoboys.' });
     return sendJSON(res, 200, { couriers: readJSON(COURIERS_FILE) });
   }
   // ── POST /api/admin/couriers — cadastra um novo motoboy ──
   if (pathname === '/api/admin/couriers' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra cadastrar motoboys.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarSetores')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra cadastrar motoboys.' });
     try {
       const { name, phone, plate, notes, photo } = await readBody(req);
       const nm = String(name || '').trim();
@@ -2547,7 +3029,7 @@ async function handleRequest(req, res) {
   }
   // ── PATCH /api/admin/couriers/:id — edita dados ou ativa/desativa um motoboy ──
   if (pathname.match(/^\/api\/admin\/couriers\/[^/]+$/) && req.method === 'PATCH') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra editar motoboys.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarSetores')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra editar motoboys.' });
     try {
       const id = decodeURIComponent(pathname.split('/').pop());
       const body = await readBody(req);
@@ -2566,7 +3048,7 @@ async function handleRequest(req, res) {
   }
   // ── DELETE /api/admin/couriers/:id — remove um motoboy do cadastro ──
   if (pathname.match(/^\/api\/admin\/couriers\/[^/]+$/) && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra remover motoboys.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarSetores')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra remover motoboys.' });
     const id = decodeURIComponent(pathname.split('/').pop());
     let couriers = readJSON(COURIERS_FILE);
     const existed = couriers.some(c => c.id === id);
@@ -2625,7 +3107,7 @@ async function handleRequest(req, res) {
   // ── POST /api/chat/background — envia uma foto nova, escolhe uma da galeria pronta, ou só
   // ativa/desativa e ajusta o escurecido sem trocar a imagem (manda só { enabled } / { overlay }). ──
   if (pathname === '/api/chat/background' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar o fundo do chat.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'editarInformacoes')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar o fundo do chat.' });
     try {
       const { dataUrl, presetUrl, presetName, enabled, overlay, target } = await readBody(req, 8e6);
       const cfgKey = target === 'admin' ? 'adminChatBackground' : 'chatBackground';
@@ -2685,7 +3167,7 @@ async function handleRequest(req, res) {
 
   // ── DELETE /api/chat/background — remove a foto e volta pro fundo padrão. ──
   if (pathname === '/api/chat/background' && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar o fundo do chat.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'editarInformacoes')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra alterar o fundo do chat.' });
     try {
       const cfgKey = query.target === 'admin' ? 'adminChatBackground' : 'chatBackground';
       const current = readConfig();
@@ -2758,7 +3240,7 @@ async function handleRequest(req, res) {
   // caindo pro valor fixo se o bairro da entrega não estiver cadastrado).
   // Query params: from, to (datas AAAA-MM-DD), courier ('' = todos).
   if (pathname === '/api/admin/courier-report' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver esse relatório.' });
+    if (!requirePermission(getToken(req, query), 'relatorios', 'ver')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver esse relatório.' });
     const { cfg } = readConfig();
     const orders = readJSON(ORDERS_FILE);
     const from = query.from ? new Date(query.from + 'T00:00:00').getTime() : 0;
@@ -2858,6 +3340,17 @@ async function handleRequest(req, res) {
     });
   }
 
+  // v109: GET /api/me — devolve role/permissões/status ATUALIZADOS pro token atual. O painel
+  // chama isso ao abrir/voltar de segundo plano pra saber na hora se o Master mudou alguma
+  // permissão (ou desativou o usuário) enquanto a aba ficava aberta — sem precisar deslogar.
+  if (pathname === '/api/me' && req.method === 'GET') {
+    const session = getSession(getToken(req, query));
+    if (!session) return sendJSON(res, 401, { error: 'unauthorized' });
+    const user = findUserBySession(session);
+    if (user && user.active === false) return sendJSON(res, 403, { error: 'Usuário desativado.', deactivated: true });
+    return sendJSON(res, 200, { role: session.role, username: session.username, permissions: effectivePermissions(session) });
+  }
+
   // ── POST /api/login — autenticação do painel (usuário + senha, com nível de acesso) ──
   if (pathname === '/api/login' && req.method === 'POST') {
     try {
@@ -2867,6 +3360,7 @@ async function handleRequest(req, res) {
 
       if (uname) {
         const user = (cfg.users || []).find(u => String(u.username || '').toLowerCase() === uname);
+        if (user && user.active === false) return sendJSON(res, 403, { error: 'Este usuário está desativado. Fale com o administrador master.' });
         if (user && verifyUserPassword(user, password)) {
           // Migração silenciosa: conta antiga só com senha em texto puro vira hash agora que
           // provou saber a senha certa — nenhuma ação extra pedida ao usuário.
@@ -2875,14 +3369,14 @@ async function handleRequest(req, res) {
             const u2 = (data.cfg.users || []).find(u => String(u.username || '').toLowerCase() === uname);
             if (u2) { u2.passwordHash = hashUserPassword(u2.username, password); delete u2.password; writeJSON(CONFIG_FILE, data); }
           }
-          return sendJSON(res, 200, { token: newSession(user.role, user.username), role: user.role, username: user.username });
+          return sendJSON(res, 200, { token: newSession(user.role, user.username), role: user.role, username: user.username, permissions: effectivePermissions({ role: user.role, username: user.username }) });
         }
         return sendJSON(res, 401, { error: 'Usuário ou senha incorretos.' });
       }
 
       // Compatibilidade: login sem usuário (só senha) continua funcionando como antes.
-      if (password === cfg.adminPass) return sendJSON(res, 200, { token: newSession('admin', 'admin'), role: 'admin', username: 'admin' });
-      if (password === cfg.masterPass) return sendJSON(res, 200, { token: newSession('master', 'master'), role: 'master', username: 'master' });
+      if (password === cfg.adminPass) return sendJSON(res, 200, { token: newSession('admin', 'admin'), role: 'admin', username: 'admin', permissions: effectivePermissions({ role: 'admin', username: 'admin' }) });
+      if (password === cfg.masterPass) return sendJSON(res, 200, { token: newSession('master', 'master'), role: 'master', username: 'master', permissions: fullPermTemplate(true) });
       return sendJSON(res, 401, { error: 'senha incorreta' });
     } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
   }
@@ -3058,7 +3552,7 @@ async function handleRequest(req, res) {
   // Render (nuvem), nunca vai achar nada — a impressora não está fisicamente
   // conectada ao servidor na nuvem.
   if (pathname === '/api/admin/detect-usb-printers' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarImpressoras')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão.' });
     const candidates = [];
     try {
       ['/dev/usb', '/dev'].forEach(dir => {
@@ -3082,7 +3576,7 @@ async function handleRequest(req, res) {
   // isso é a rede interna da nuvem — nunca vai enxergar o Wi-Fi do restaurante.
   // Só é útil de verdade se o servidor rodar localmente, na mesma rede da impressora.
   if (pathname === '/api/admin/detect-network-printers' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'configurarImpressoras')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão.' });
     const nets = os.networkInterfaces();
     let base = null;
     Object.values(nets).flat().forEach(n => {
@@ -3182,7 +3676,7 @@ async function handleRequest(req, res) {
   // ?format=csv&type=clientes|pedidos -> planilha simples (abre no Excel/Sheets)
   // ?format=txt&type=cardapio -> cardápio em texto simples, fácil de ler/imprimir
   if (pathname === '/api/admin/backup' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra exportar dados.' });
+    if (!requirePermission(getToken(req, query), 'sistema', 'logs')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra exportar dados.' });
     const format = query.format || 'json';
     const type = query.type || '';
     const stamp = new Date().toISOString().slice(0, 10);
@@ -3275,7 +3769,14 @@ function estimateDeliveryWindow(order, cfg) {
   const timeText = order.mode === 'retirada' ? (cfg.timeRetirada || cfg.time) : cfg.time;
   const nums = String(timeText || '').match(/\d+/g);
   const created = new Date(order.createdAt);
-  const fmt = (d) => d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  // v133 — BUG CORRIGIDO ("previsão de entrega errada na comanda", ex.: pedido feito às
+  // 00:18 mostrando previsão 03:58–04:18 em vez de 00:58–01:18): o servidor roda hospedado
+  // num relógio configurado em UTC (padrão de praticamente todo host na nuvem), e essa função
+  // formatava o horário sem dizer EM QUE FUSO — o Node então usa o fuso do SISTEMA (UTC), não
+  // o horário de Brasília (UTC-3), o que empurra a previsão pra 3 horas à frente do horário
+  // real. `timeZone: 'America/Sao_Paulo'` já era usado em outro lugar do sistema (linha ~658)
+  // exatamente por essa razão — só faltava aplicar aqui também.
+  const fmt = (d) => d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
   if (nums && nums.length >= 2) {
     const from = new Date(created.getTime() + parseInt(nums[0]) * 60000);
     const to = new Date(created.getTime() + parseInt(nums[nums.length - 1]) * 60000);
@@ -3300,11 +3801,20 @@ function estimateDeliveryWindow(order, cfg) {
     try {
       const { orderId, station, ok, error } = await readBody(req);
       if (!orderId || !station) return sendJSON(res, 400, { error: 'orderId e station são obrigatórios.' });
+      // v122: fecha o ciclo da trava automática. Sucesso vira DONE; falha libera a via para retry.
+      try {
+        const orders = readJSON(ORDERS_FILE); const oi = orders.findIndex(o=>o.id===orderId);
+        if(oi>-1){ const o=orders[oi]; if(!o.autoPrintState)o.autoPrintState={};
+          if(ok){ o.autoPrintState[station]={status:'done',finishedAt:new Date().toISOString()}; o.autoPrinted=o.autoPrinted||{}; o.autoPrinted[station]=true; }
+          else { delete o.autoPrintState[station]; if(o.autoPrinted) delete o.autoPrinted[station]; }
+          orders[oi]=o; writeJSON(ORDERS_FILE,orders);
+        }
+      } catch(e) { console.error('⚠️ Não consegui atualizar estado da impressão:',e.message); }
       if (!ok) {
         try {
           const log = readJSON(PRINT_LOG_FILE);
-          log.unshift({ orderId, station, error: String(error || 'Falha desconhecida').slice(0, 500), ts: new Date().toISOString() });
-          fs.writeFileSync(PRINT_LOG_FILE, JSON.stringify(log.slice(0, 500), null, 2)); // guarda só os 500 mais recentes
+          log.unshift({ orderId, station, error: String(error || 'Falha desconhecida').slice(0, 500), ts: new Date().toISOString(), retryable:true });
+          fs.writeFileSync(PRINT_LOG_FILE, JSON.stringify(log.slice(0, 500), null, 2));
         } catch (e) { console.error('⚠️  Não consegui gravar print-log.json:', e.message); }
       }
       broadcast('print-result', { orderId, station, ok: !!ok, error: error || null });
@@ -3338,26 +3848,30 @@ function estimateDeliveryWindow(order, cfg) {
     if (!checkAuth(getToken(req, query))) return sendJSON(res, 401, { error: 'unauthorized' });
     try {
       const { kind, id, station } = await readBody(req);
+      const now=Date.now(), leaseMs=90000;
       if (kind === 'reservation') {
-        const list = readJSON(RESERVATIONS_FILE);
-        const idx = list.findIndex(r => r.id === id);
-        if (idx === -1) return sendJSON(res, 404, { error: 'Reserva não encontrada.', claimed: false });
-        if (list[idx].autoPrinted) return sendJSON(res, 200, { claimed: false, alreadyClaimed: true });
-        list[idx].autoPrinted = true;
-        writeJSON(RESERVATIONS_FILE, list);
-        return sendJSON(res, 200, { claimed: true });
+        const list=readJSON(RESERVATIONS_FILE); const idx=list.findIndex(r=>r.id===id); if(idx===-1)return sendJSON(res,404,{error:'Reserva não encontrada.',claimed:false});
+        const r=list[idx]; const state=r.autoPrintState; if(r.autoPrinted||state?.status==='done')return sendJSON(res,200,{claimed:false,alreadyClaimed:true});
+        if(state?.status==='printing' && now-Number(state.claimedAt||0)<leaseMs)return sendJSON(res,200,{claimed:false,alreadyPrinting:true});
+        r.autoPrintState={status:'printing',claimedAt:now}; list[idx]=r; writeJSON(RESERVATIONS_FILE,list); return sendJSON(res,200,{claimed:true});
       }
-      // kind === 'order' (padrão)
-      if (!station) return sendJSON(res, 400, { error: 'station obrigatório.', claimed: false });
-      const orders = readJSON(ORDERS_FILE);
-      const idx = orders.findIndex(o => o.id === id);
-      if (idx === -1) return sendJSON(res, 404, { error: 'Pedido não encontrado.', claimed: false });
-      if (!orders[idx].autoPrinted) orders[idx].autoPrinted = {};
-      if (orders[idx].autoPrinted[station]) return sendJSON(res, 200, { claimed: false, alreadyClaimed: true });
-      orders[idx].autoPrinted[station] = true;
-      writeJSON(ORDERS_FILE, orders);
-      return sendJSON(res, 200, { claimed: true });
-    } catch (e) { return sendJSON(res, 400, { error: 'invalid body', claimed: false }); }
+      if(!station)return sendJSON(res,400,{error:'station obrigatório.',claimed:false});
+      const orders=readJSON(ORDERS_FILE); const idx=orders.findIndex(o=>o.id===id); if(idx===-1)return sendJSON(res,404,{error:'Pedido não encontrado.',claimed:false});
+      const o=orders[idx]; o.autoPrintState=o.autoPrintState||{}; const state=o.autoPrintState[station];
+      if(o.autoPrinted?.[station] || state?.status==='done')return sendJSON(res,200,{claimed:false,alreadyClaimed:true});
+      if(state?.status==='printing' && now-Number(state.claimedAt||0)<leaseMs)return sendJSON(res,200,{claimed:false,alreadyPrinting:true});
+      o.autoPrintState[station]={status:'printing',claimedAt:now}; orders[idx]=o; writeJSON(ORDERS_FILE,orders); return sendJSON(res,200,{claimed:true});
+    } catch(e){return sendJSON(res,400,{error:'invalid body',claimed:false});}
+  }
+
+  // v122 — libera/fecha reservas de impressão quando o agente termina ou falha.
+  if (pathname === '/api/print-agent/release' && req.method === 'POST') {
+    if (!checkAuth(getToken(req, query))) return sendJSON(res,401,{error:'unauthorized'});
+    try{ const {kind,id,station}=await readBody(req); if(kind==='reservation'){const list=readJSON(RESERVATIONS_FILE);const i=list.findIndex(r=>r.id===id);if(i>-1){delete list[i].autoPrintState;writeJSON(RESERVATIONS_FILE,list);}} else {const orders=readJSON(ORDERS_FILE);const i=orders.findIndex(o=>o.id===id);if(i>-1){delete (orders[i].autoPrintState||{})[station];if(orders[i].autoPrinted)delete orders[i].autoPrinted[station];writeJSON(ORDERS_FILE,orders);}} return sendJSON(res,200,{ok:true}); }catch(e){return sendJSON(res,400,{error:'invalid body'});}
+  }
+  if (pathname === '/api/print-agent/complete' && req.method === 'POST') {
+    if (!checkAuth(getToken(req, query))) return sendJSON(res,401,{error:'unauthorized'});
+    try{ const {kind,id,station}=await readBody(req); if(kind==='reservation'){const list=readJSON(RESERVATIONS_FILE);const i=list.findIndex(r=>r.id===id);if(i>-1){list[i].autoPrinted=true;delete list[i].autoPrintState;writeJSON(RESERVATIONS_FILE,list);}} else {const orders=readJSON(ORDERS_FILE);const i=orders.findIndex(o=>o.id===id);if(i>-1){orders[i].autoPrinted=orders[i].autoPrinted||{};orders[i].autoPrinted[station]=true;orders[i].autoPrintState=orders[i].autoPrintState||{};orders[i].autoPrintState[station]={status:'done',finishedAt:new Date().toISOString()};writeJSON(ORDERS_FILE,orders);}} return sendJSON(res,200,{ok:true}); }catch(e){return sendJSON(res,400,{error:'invalid body'});}
   }
 
   // ── POST /api/print-agent/announce — o Agente Local avisa "estou vivo" (v82) ──
@@ -3394,6 +3908,16 @@ function estimateDeliveryWindow(order, cfg) {
     } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
   }
 
+  // ── GET /api/health — diagnóstico leve para monitoramento/deploy. Não expõe dados do restaurante.
+  if (pathname === '/api/health' && req.method === 'GET') {
+    const checks = {};
+    for (const [name, file] of Object.entries({config: CONFIG_FILE, orders: ORDERS_FILE, customers: CUSTOMERS_FILE})) {
+      try { fs.accessSync(file, fs.constants.R_OK | fs.constants.W_OK); checks[name] = true; } catch (_) { checks[name] = false; }
+    }
+    const ok = Object.values(checks).every(Boolean);
+    return sendJSON(res, ok ? 200 : 503, {ok, service:'shogatsu-pedidos', version:'1.0.133', checks, uptimeSec:Math.floor(process.uptime()), time:new Date().toISOString()});
+  }
+
   // ── GET /api/print-agent/status — o painel consulta pra mostrar se tem algum Agente Local
   // conectado agora, e quais vias cada um cobre (v82); agora também informa quantos
   // Terminais de Impressão (modo Navegador) estão de fato ativos agora (v85) ──
@@ -3402,6 +3926,43 @@ function estimateDeliveryWindow(order, cfg) {
     const agents = getOnlinePrintAgents();
     const coveredStations = [...new Set(agents.flatMap(a => a.printers.flatMap(p => p.stations)))];
     return sendJSON(res, 200, { online: agents.length > 0, agents, coveredStations, terminalsOnline: getOnlinePrintTerminalsCount(), currentAgentBuild: CURRENT_AGENT_BUILD });
+  }
+
+  // ── GET /api/print-agent/pending — v125-part1: recuperação de impressão após queda de SSE/rede.
+  // O Agente Local consulta esta fila periodicamente. Assim, se ele estava offline quando o
+  // evento 'new-order' aconteceu, o pedido não fica perdido: ele reaparece aqui até cada via
+  // ser concluída. A trava por pedido+via continua sendo feita em /api/print-agent/claim, então
+  // dois agentes consultando a mesma fila não imprimem a mesma via duas vezes.
+  if (pathname === '/api/print-agent/pending' && req.method === 'GET') {
+    if (!checkAuth(getToken(req, query))) return sendJSON(res, 401, { error: 'unauthorized' });
+    try {
+      const now = Date.now();
+      const maxAgeMs = 48 * 60 * 60 * 1000;
+      // v131 — corrige "tempo de entrega deve ser o que está definido no sistema": os pedidos
+      // recuperados por aqui (Agente Local que estava offline quando o pedido chegou) não
+      // levavam o horário de previsão calculado (_deliveryWindow) — só o broadcast 'new-order'
+      // levava isso. Agora os dois caminhos calculam do mesmo jeito, com a MESMA configuração
+      // (cfg.time/cfg.timeRetirada), então o Agente Local mostra o horário certo não importa
+      // se recebeu o pedido em tempo real ou recuperou depois de reconectar.
+      const { cfg } = readConfig();
+      const orders = readJSON(ORDERS_FILE)
+        .filter(o => o && o.autoPrintEligible === true && !['cancelado','entregue'].includes(o.status))
+        .filter(o => now - new Date(o.createdAt || 0).getTime() <= maxAgeMs)
+        .filter(o => {
+          const states = o.autoPrintState || {};
+          return !o.autoPrinted || Object.keys(states).some(st => states[st]?.status !== 'done') || Object.keys(states).length === 0;
+        })
+        .slice(0, 100)
+        .map(o => ({ ...o, _deliveryWindow: estimateDeliveryWindow(o, cfg) }));
+      const reservations = readJSON(RESERVATIONS_FILE)
+        .filter(r => r && r.autoPrintEligible === true)
+        .filter(r => now - new Date(r.createdAt || 0).getTime() <= maxAgeMs)
+        .filter(r => !r.autoPrinted && r.autoPrintState?.status !== 'done')
+        .slice(0, 100);
+      return sendJSON(res, 200, { ok: true, orders, reservations, serverTime: new Date().toISOString() });
+    } catch (e) {
+      return sendJSON(res, 500, { error: 'Não foi possível consultar a fila de impressão.', retryable: true });
+    }
   }
 
   // ── POST /api/print-station/register — o Painel avisa que abriu/está ativo AGORA e assume
@@ -3473,6 +4034,11 @@ function estimateDeliveryWindow(order, cfg) {
       if (!order) return sendJSON(res, 404, { error: 'Pedido não encontrado.' });
 
       const isCaixa = st === 'caixa';
+      // v129 — NOVO ("via do motoboy/expedição deve focar em cliente/endereço/pagamento, não
+      // na lista de itens como cozinha/sushibar"): ver DEFAULT_CFG.stations.delivery/expedicao
+      // acima — qualquer via marcada com kind:'dispatch' usa o layout de despacho (mesmos
+      // dados de entrega do Caixa, sem lista de itens) em vez do layout de produção.
+      const isDispatch = !isCaixa && !!(cfg.stations[st] && cfg.stations[st].kind === 'dispatch');
 
       // v106 — REMOVIDO: a trava "só a Estação Ativa pode imprimir" (v90) que existia aqui.
       // Motivo: ela bloqueava IMPRESSÃO MANUAL (clique em Imprimir/Reimprimir, inclusive do
@@ -3495,9 +4061,14 @@ function estimateDeliveryWindow(order, cfg) {
       }
 
       // Caixa: comprovante completo (todos os itens + dados do cliente + horário).
+      // Despacho (delivery/expedição): dados de entrega do Caixa, sem lista de itens — quem
+      // sai pra entregar não precisa conferir prato por prato, só pra onde ir e quanto cobrar.
       // Cozinha/Sushibar/Bar: só os itens daquela estação + observações, sem dados pessoais.
-      const items = isCaixa ? order.items : order.items.filter(i => (i.stations || []).includes(st));
-      if (!items.length) return sendJSON(res, 200, { ok: true, printed: false, skipped: true, order, station: st });
+      const items = (isCaixa || isDispatch) ? order.items : order.items.filter(i => (i.stations || []).includes(st));
+      // v129: via de despacho só faz sentido pra pedido DELIVERY (retirada não tem motoboy pra
+      // avisar) — pula sem erro, igual já acontece quando uma via de produção não tem itens.
+      if (isDispatch && order.mode !== 'delivery') return sendJSON(res, 200, { ok: true, printed: false, skipped: true, order, station: st });
+      if (!isDispatch && !items.length) return sendJSON(res, 200, { ok: true, printed: false, skipped: true, order, station: st });
 
       // v86 — CORRIGIDO ("imprimiu 3 cópias da mesma via"): cfg.print (auto-impressão) é um
       // interruptor GLOBAL — todo painel aberto e conectado, em qualquer aparelho (ou aba),
@@ -3512,14 +4083,35 @@ function estimateDeliveryWindow(order, cfg) {
       // auto-print; qualquer segunda chamada automática pra essa MESMA via desse MESMO pedido
       // é ignorada, não importa de quantos painéis abertos ela venha.
       if (auto) {
-        if (!order.autoPrinted) order.autoPrinted = {};
-        if (order.autoPrinted[st]) {
-          return sendJSON(res, 200, { ok: true, printed: false, skipped: true, alreadyAutoPrinted: true, order, station: st });
-        }
-        order.autoPrinted[st] = true;
-        const idx = orders.findIndex(o => o.id === order.id);
-        if (idx > -1) orders[idx] = order;
-        writeJSON(ORDERS_FILE, orders);
+        const now=Date.now(); const leaseMs=90000;
+        if(!order.autoPrintState) order.autoPrintState={};
+        const state=order.autoPrintState[st];
+        if(order.autoPrinted?.[st] || state?.status==='done') return sendJSON(res,200,{ok:true,printed:false,skipped:true,alreadyAutoPrinted:true,order,station:st});
+        if(state?.status==='printing' && now-Number(state.claimedAt||0)<leaseMs) return sendJSON(res,200,{ok:true,printed:false,skipped:true,alreadyAutoPrinting:true,order,station:st});
+        order.autoPrintState[st]={status:'printing',claimedAt:now,owner:String(stationId||originId||'panel').slice(0,120)};
+        const idx = orders.findIndex(o => o.id === order.id); if(idx>-1) orders[idx]=order; writeJSON(ORDERS_FILE,orders);
+      } else if (!order.autoPrintState || !order.autoPrintState[st]) {
+        // v132 — BUG CORRIGIDO ("vias imprimindo duplicado ao clicar"): a trava acima (v86)
+        // só valia pra disparo AUTOMÁTICO, de propósito — reimpressão manual sempre deveria
+        // funcionar sem trava nenhuma (v106), pra staff poder forçar reimpressão de uma via
+        // que travou/errou. Só que isso deixava uma brecha real: se DOIS aparelhos (ex.:
+        // celular + tablet, os dois com o painel de um pedido NOVO aberto) clicassem
+        // "🖨 Imprimir" quase ao mesmo tempo, os dois cliques manuais passavam direto sem
+        // trava nenhuma — a mesma via saía impressa 2 vezes. Agora aplica essa MESMA trava de
+        // 90s (idêntica à automática), só que É SÓ PRA PRIMEIRA VEZ — se essa via NUNCA foi
+        // impressa nesse pedido (nem automático nem manual, `autoPrintState[st]` não existe),
+        // protege contra o clique duplicado de dois aparelhos. Assim que existe QUALQUER
+        // registro pra essa via — mesmo que tenha sido só essa primeira trava, sem nunca ter
+        // sido marcado "done" — os próximos cliques manuais (reimpressão deliberada, minutos
+        // ou horas depois) pulam esse bloco inteiro e imprimem sem nenhum bloqueio, igual
+        // sempre funcionou. Ou seja: protege só a corrida do primeiro clique, nunca atrapalha
+        // uma reimpressão de propósito.
+        const now=Date.now(); const leaseMs=90000;
+        if(!order.autoPrintState) order.autoPrintState={};
+        const state=order.autoPrintState[st];
+        if(state?.status==='printing' && now-Number(state.claimedAt||0)<leaseMs) return sendJSON(res,200,{ok:true,printed:false,skipped:true,alreadyPrinting:true,order,station:st});
+        order.autoPrintState[st]={status:'printing',claimedAt:now,owner:String(stationId||originId||'panel').slice(0,120)};
+        const idx = orders.findIndex(o => o.id === order.id); if(idx>-1) orders[idx]=order; writeJSON(ORDERS_FILE,orders);
       }
 
       const deliveryWindow = estimateDeliveryWindow(order, cfg);
@@ -3588,67 +4180,150 @@ function estimateDeliveryWindow(order, cfg) {
 
       // v44: layout ESC/POS redesenhado — cabeçalho centralizado, blocos com título
       // (CLIENTE/ITENS/RESUMO no comprovante; HORÁRIOS/ITENS na via de produção), valores
-      // alinhados à direita (padStart até 32 colunas = largura útil de 58/80mm), TOTAL em
-      // destaque. Sem emoji no ESC/POS puro (impressora térmica não garante suporte a eles);
-      // o emoji fica só na via impressa pelo navegador (openBrowserTicket, no painel.html).
-      const HR = '--------------------------------';
-      const HR2 = '================================';
+      // alinhados à direita (padStart até a largura configurada — ver printCols() acima),
+      // TOTAL em destaque. Sem emoji no ESC/POS puro (impressora térmica não garante suporte
+      // a eles); o emoji fica só na via impressa pelo navegador (openBrowserTicket, no
+      // painel.html).
+      // v126 — BUG CORRIGIDO ("ajuste pra caber na bobina 80mm"): esse 32 aqui era FIXO,
+      // sempre — certo pra 58mm, mas deixava uma bobina de 80mm com metade da largura sem
+      // uso. Agora usa printCols(cfg), que respeita cfg.printWidth (Configurações → Central
+      // de Impressão → Fonte de Impressão → Largura da bobina).
+      const cols = printCols(cfg);
+      const HR = '-'.repeat(cols);
+      const HR2 = '='.repeat(cols);
+      // v128 — usado só nas linhas de nome do item (ver items.forEach mais abaixo) — reaproveita
+      // o mesmo cálculo do buildTicketText, então "wideOn" já parte do tamanho configurado em
+      // Fonte de Impressão, só com a largura +1 nível.
+      const tamItem = tamanhoImpressaoTermica(cfg.printSize);
       const money = v => 'R$ ' + Number(v || 0).toFixed(2).replace('.', ',');
       const rightAlignRow = (label, value) => {
-        const pad = Math.max(1, 32 - label.length - value.length);
+        const pad = Math.max(1, cols - label.length - value.length);
         return label + ' '.repeat(pad) + value;
       };
       const refShort = String(order.id || '').slice(-11).toUpperCase();
       const lines = [];
-      lines.push(ESC.center + ESC.boldOn + (cfg.name || 'SHOGATSU').toUpperCase() + ESC.boldOff);
-      lines.push((cfg.tagline || 'CULINARIA ORIENTAL').toUpperCase() + ESC.left);
+      // v131 — NOVO VISUAL DO COMPROVANTE (só layout — nenhuma lógica de impressão, fila,
+      // anti-duplicação, ESC/POS de corte/bipe/código-de-página ou comunicação com impressora
+      // foi tocada aqui, só o TEXTO/formatação das linhas do corpo do ticket): cabeçalho
+      // agora emoldurado por linhas duplas em cima E embaixo (era só embaixo), pedido de um
+      // visual mais "premium/minimalista" inspirado em comprovante de restaurante japonês.
       lines.push(HR2);
+      // v133 — BUG CORRIGIDO ("cabeçalho deve ter apenas Shogatsu Culinária Oriental"): a
+      // linha de subtítulo (cfg.tagline, padrão "CULINARIA ORIENTAL") aparecia LOGO ABAIXO do
+      // nome da loja — se o nome já configurado em cfg.name for "Shogatsu Culinária Oriental"
+      // (como é o caso aqui), o cabeçalho saía com o nome inteiro e, na linha de baixo, uma
+      // repetição de parte dele ("CULINÁRIA ORIENTAL" de novo). Cabeçalho agora mostra só o
+      // nome da loja (cfg.name), uma vez só — sem linha de subtítulo separada.
+      lines.push(ESC.center + ESC.boldOn + (cfg.name || 'SHOGATSU').toUpperCase() + ESC.boldOff + ESC.left);
+      lines.push(HR2);
+      lines.push('');
+      // v131: "PEDIDO #" é o elemento mais destacado do ticket inteiro (pedido explícito do
+      // novo layout) — maior + negrito, centralizado, sozinho na própria linha.
+      lines.push(ESC.center + ESC.boldOn + tamItem.wideOn + (order.ticketNumber ? 'PEDIDO Nº ' + order.ticketNumber : 'PEDIDO #' + order.id) + tamItem.on + ESC.boldOff + ESC.left);
+      lines.push('');
 
       if (isCaixa) {
         // ── Via do Caixa: comprovante completo (dados do cliente + horário estimado) ──
-        lines.push(ESC.center + 'COMPROVANTE' + ESC.left);
-        lines.push((order.ticketNumber ? 'Pedido Nº ' + order.ticketNumber : 'Pedido #' + order.id));
-        lines.push('Data: ' + new Date(order.createdAt).toLocaleDateString('pt-BR'));
-        lines.push('Hora: ' + new Date(order.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }));
-        lines.push('Ref.: #' + refShort);
-        lines.push(order.mode === 'delivery' ? 'ENTREGA (DELIVERY)' : 'RETIRADA');
+        // v131 — NOVO VISUAL (só formatação/ordem das linhas — nenhum dado novo, nenhum
+        // cálculo novo, nenhuma lógica de impressão mudou): layout "premium minimalista"
+        // pedido, agrupado por finalidade (DATA/HORA/TIPO, ITENS, OBSERVAÇÃO, CLIENTE/
+        // TELEFONE/ENDEREÇO, PAGAMENTO+TOTAL), com separadores simples e o nome dos produtos
+        // maior e em negrito — mesmo tratamento que a via de produção já ganhou na v128.
+        // "Ref.: #" (código curto) saiu do topo pra não competir visualmente com "PEDIDO #"
+        // (agora o elemento mais destacado, no cabeçalho compartilhado acima) — continua
+        // disponível, só que junto do resumo de pagamento no rodapé, onde ainda serve pra
+        // conferência sem disputar atenção com o número do pedido.
         lines.push(HR);
+        lines.push('DATA: ' + new Date(order.createdAt).toLocaleDateString('pt-BR', { timeZone: 'America/Sao_Paulo' }));
+        lines.push('HORA: ' + new Date(order.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' }));
+        lines.push('TIPO: ' + (order.mode === 'delivery' ? 'DELIVERY' : 'RETIRADA'));
+        lines.push(HR);
+        lines.push('');
+        items.forEach(i => {
+          lines.push(`${i.qty}x  ` + ESC.boldOn + tamItem.wideOn + i.name + tamItem.on + ESC.boldOff);
+        });
+        lines.push(HR);
+        if (order.obs) {
+          lines.push('');
+          lines.push(ESC.boldOn + 'OBSERVACAO' + ESC.boldOff);
+          lines.push(order.obs);
+          lines.push(HR);
+        }
+        lines.push('');
         lines.push(ESC.boldOn + 'CLIENTE' + ESC.boldOff);
-        lines.push(HR);
         lines.push(order.name);
-        lines.push('Tel: ' + order.phone);
-        if (order.mode === 'delivery') lines.push('End: ' + order.address);
-        lines.push((order.mode === 'delivery' ? 'Previsao: ' : 'Previsao retirada: ') + deliveryWindow);
+        lines.push('');
+        lines.push(ESC.boldOn + 'TELEFONE' + ESC.boldOff);
+        lines.push(order.phone);
+        if (order.mode === 'delivery') {
+          lines.push('');
+          lines.push(ESC.boldOn + 'ENDERECO' + ESC.boldOff);
+          lines.push(order.address);
+        }
+        lines.push((order.mode === 'delivery' ? 'Previsao: ' : 'Previsao retirada: ') + deliveryWindow + '   Ref.: #' + refShort);
         lines.push(HR);
-        lines.push(ESC.boldOn + 'ITENS' + ESC.boldOff);
-        lines.push(HR);
-        items.forEach(i => lines.push(rightAlignRow(`${i.qty}x ${i.name}`, money(i.price * i.qty))));
-        if (order.obs) { lines.push(HR); lines.push('Obs: ' + order.obs); }
-        lines.push(HR);
-        lines.push(ESC.boldOn + 'RESUMO' + ESC.boldOff);
-        lines.push(HR);
+        lines.push('');
+        lines.push(ESC.boldOn + 'PAGAMENTO' + ESC.boldOff);
+        lines.push(payMethodTicketLabel(order) + (order.troco ? ' (troco para ' + order.troco + ')' : ''));
+        lines.push('');
         lines.push(rightAlignRow('Subtotal', money(order.subtotal)));
         lines.push(rightAlignRow('Entrega', money(order.fee)));
         if (order.discount > 0 || order.couponCode) {
           lines.push(rightAlignRow(`Cupom ${order.couponCode}`, '-' + money(order.discount || 0)));
         }
-        lines.push(HR);
-        lines.push(ESC.boldOn + ESC.doubleOn + rightAlignRow('TOTAL', money(order.total)) + ESC.doubleOff + ESC.boldOff);
+        lines.push('');
+        lines.push(ESC.boldOn + 'TOTAL' + ESC.boldOff);
+        lines.push(ESC.boldOn + tamItem.wideOn + money(order.total) + tamItem.on + ESC.boldOff);
         lines.push(HR2);
-        lines.push('Pagamento: ' + payMethodTicketLabel(order) + (order.troco ? ' (troco para ' + order.troco + ')' : ''));
-        lines.push(ESC.center + 'Obrigado pela preferencia!' + ESC.left);
-        if (cfg.siteUrl) lines.push(ESC.center + cfg.siteUrl + ESC.left);
+        lines.push('');
+        // v133 — BUG CORRIGIDO ("rodapé deve ter apenas Obrigado pela Preferência"): antes
+        // repetia "OBRIGADO!" + o nome da loja de novo (redundante — o nome já aparece bem
+        // no topo do ticket). Volta pra uma linha só, direta.
+        lines.push(ESC.center + ESC.boldOn + 'OBRIGADO PELA PREFERENCIA!' + ESC.boldOff + ESC.left);
+        lines.push(HR2);
+        if (cfg.siteUrl) { lines.push(''); lines.push(ESC.center + cfg.siteUrl + ESC.left); }
+      } else if (isDispatch) {
+        // v129 — NOVO ("via do motoboy/expedição deve focar em cliente/endereço/pagamento"):
+        // mesmo bloco de dados de entrega do Caixa (endereço, pagamento, troco), sem a lista
+        // de itens — quem vai entregar não precisa conferir prato por prato, só pra onde ir e
+        // quanto cobrar/receber. Reaproveita os mesmos campos do pedido que o Caixa já usa
+        // (order.address, order.courierName etc.) — não inventa estrutura de dado nova.
+        lines.push(ESC.center + ESC.boldOn + ((cfg.stations[st] && cfg.stations[st].label) || st).toUpperCase() + ESC.boldOff + ESC.left);
+        lines.push(ESC.center + 'VIA DE DESPACHO' + ESC.left);
+        lines.push(HR);
+        lines.push('Ref.: #' + refShort);
+        lines.push(HR);
+        lines.push(ESC.boldOn + 'CLIENTE' + ESC.boldOff);
+        lines.push(HR);
+        lines.push(order.name);
+        lines.push('Tel: ' + order.phone);
+        lines.push(HR);
+        lines.push(ESC.boldOn + 'ENDERECO' + ESC.boldOff);
+        lines.push(HR);
+        lines.push(order.address || '—');
+        lines.push(HR);
+        lines.push(ESC.boldOn + 'PAGAMENTO' + ESC.boldOff);
+        lines.push(HR);
+        lines.push(payMethodTicketLabel(order));
+        lines.push(rightAlignRow('Total:', money(order.total)));
+        if (order.troco) lines.push(rightAlignRow('Troco para:', String(order.troco)));
+        lines.push(HR);
+        lines.push(rightAlignRow('Taxa de entrega:', money(order.fee)));
+        lines.push(rightAlignRow('Motoboy:', order.courierName || 'A definir'));
+        lines.push(rightAlignRow('Previsao entrega:', deliveryWindow));
+        if (order.obs) { lines.push(HR); lines.push(ESC.boldOn + 'OBSERVACAO' + ESC.boldOff); lines.push(order.obs); }
+        lines.push(HR2);
       } else {
         // ── Vias de produção (cozinha/sushibar/bar): layout idêntico entre as três vias ──
         // v40: previsão de saída automática = Entrada + tempo de preparo configurado pra essa estação.
         const prepMin = Number((cfg.stations[st] && cfg.stations[st].prepTime)) || 15;
-        const entrada = new Date(order.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        const entrada = new Date(order.createdAt).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
         const saidaPrevista = new Date(new Date(order.createdAt).getTime() + prepMin * 60000)
-          .toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+          .toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
         lines.push(ESC.center + ESC.boldOn + ((cfg.stations[st] && cfg.stations[st].label) || st).toUpperCase() + ESC.boldOff);
         lines.push('VIA DE PRODUCAO' + ESC.left);
         lines.push(HR);
-        lines.push((order.ticketNumber ? 'Pedido Nº ' + order.ticketNumber : 'Pedido #' + order.id) + '  Ref.: #' + refShort);
+        lines.push('Ref.: #' + refShort);
         lines.push(order.mode === 'delivery' ? 'DELIVERY' : 'RETIRADA');
         lines.push(HR);
         lines.push(ESC.boldOn + 'HORARIOS' + ESC.boldOff);
@@ -3662,10 +4337,29 @@ function estimateDeliveryWindow(order, cfg) {
         // saber se o pedido é pra já ou se tem uma previsão de entrega mais folgada. Agora
         // mostra as duas linhas, igual já aparece na página de Pedidos do painel.
         lines.push(rightAlignRow(order.mode === 'delivery' ? 'Prev. entrega:' : 'Prev. retirada:', deliveryWindow));
+        // v129 — NOVO ("níveis de prioridade NORMAL/ATENÇÃO/ATRASADO"): só aparece quando o
+        // pedido JÁ está atrasado ou perto de atrasar em relação à Saída Prevista DESSA via —
+        // relevante principalmente em reimpressão manual de um pedido represado (a impressão
+        // automática sai muito perto da criação do pedido, quase sempre "NORMAL" — imprimir
+        // essa palavra toda vez seria só desperdiçar papel à toa). Sem depender só de emoji
+        // (impressora térmica às vezes não imprime emoji) — o texto "ATRASADO"/"ATENCAO" vem
+        // sempre junto.
+        {
+          const saidaMs = new Date(order.createdAt).getTime() + prepMin * 60000;
+          const atraso = Date.now() - saidaMs;
+          if (atraso >= 0) lines.push(HR2 + '\n' + ESC.center + ESC.boldOn + '*** ATRASADO ***' + ESC.boldOff + ESC.left + '\n' + HR2);
+          else if (atraso >= -5 * 60000) lines.push(HR + '\n' + ESC.center + ESC.boldOn + '** ATENCAO — QUASE NA HORA **' + ESC.boldOff + ESC.left + '\n' + HR);
+        }
         lines.push(HR);
         lines.push(ESC.boldOn + ('ITENS DA ' + (((cfg.stations[st] && cfg.stations[st].label) || st).toUpperCase())) + ESC.boldOff);
         lines.push(HR);
-        items.forEach(i => lines.push('* ' + i.qty + 'x ' + i.name));
+        // v128 — NOVO ("nome do item deve ser maior e em negrito na comanda da cozinha e
+        // sushibar pra melhor visualização"): só na via de PRODUÇÃO (cozinha/sushibar/etc,
+        // não no comprovante do caixa) — quem está preparando o prato precisa bater o olho e
+        // reconhecer o item rápido, sem ter que ler letrinha miúda no meio da correria.
+        // Quantidade fica normal (bold sozinho já chama atenção o suficiente sem quebrar a
+        // linha) e só o NOME do item vem maior (largura dobrada) + negrito.
+        items.forEach(i => lines.push('* ' + i.qty + 'x ' + ESC.boldOn + tamItem.wideOn + i.name + tamItem.on + ESC.boldOff));
         lines.push(HR);
         lines.push('Observacoes:');
         if (order.obs) lines.push(order.obs);
@@ -3676,15 +4370,26 @@ function estimateDeliveryWindow(order, cfg) {
 
       try {
         if (printerCfg.method === 'rede') {
-          if (!printerCfg.ip) return sendJSON(res, 400, { error: `Impressora de rede da via "${st}" sem IP configurado.` });
+          if (!printerCfg.ip) { if(auto){try{const fresh=readJSON(ORDERS_FILE);const oi=fresh.findIndex(o=>o.id===order.id);if(oi>-1){delete (fresh[oi].autoPrintState||{})[st];writeJSON(ORDERS_FILE,fresh);}}catch(e){}} return sendJSON(res, 400, { error: `Impressora de rede da via "${st}" sem IP configurado.`, retryable:true }); }
           await sendNetworkPrint(printerCfg.ip, printerCfg.port, ticketText);
         } else if (printerCfg.method === 'usb') {
-          if (!printerCfg.device) return sendJSON(res, 400, { error: `Caminho do dispositivo USB da via "${st}" não configurado.` });
+          if (!printerCfg.device) { if(auto){try{const fresh=readJSON(ORDERS_FILE);const oi=fresh.findIndex(o=>o.id===order.id);if(oi>-1){delete (fresh[oi].autoPrintState||{})[st];writeJSON(ORDERS_FILE,fresh);}}catch(e){}} return sendJSON(res, 400, { error: `Caminho do dispositivo USB da via "${st}" não configurado.`, retryable:true }); }
           await sendUSBPrint(printerCfg.device, ticketText);
         }
+        // v132 — antes só marcava "done" pra auto (`if(auto)`); a trava do primeiro-clique
+        // manual (ver bloco acima) também precisa fechar o ciclo, senão ficaria presa em
+        // "printing" pra sempre (sem travar reimpressão — isso já não trava, ver comentário
+        // acima — mas deixaria o estado incorreto pra quem for conferir o log depois).
+        { const fresh=readJSON(ORDERS_FILE); const oi=fresh.findIndex(o=>o.id===order.id); if(oi>-1){fresh[oi].autoPrintState=fresh[oi].autoPrintState||{};fresh[oi].autoPrintState[st]={status:'done',finishedAt:new Date().toISOString()};if(auto){fresh[oi].autoPrinted=fresh[oi].autoPrinted||{};fresh[oi].autoPrinted[st]=true;}writeJSON(ORDERS_FILE,fresh);} }
         return sendJSON(res, 200, { ok: true, printed: true, order, station: st, method: printerCfg.method, usedCaixaFallback });
       } catch (printErr) {
-        return sendJSON(res, 502, { error: `Falha ao imprimir na via "${st}": ${printErr.message}` });
+        if(auto){ try{const fresh=readJSON(ORDERS_FILE);const oi=fresh.findIndex(o=>o.id===order.id);if(oi>-1){fresh[oi].autoPrintState=fresh[oi].autoPrintState||{};delete fresh[oi].autoPrintState[st];if(fresh[oi].autoPrinted)delete fresh[oi].autoPrinted[st];writeJSON(ORDERS_FILE,fresh);}}catch(e){} }
+        // v132: mesma limpeza acima, agora também pro clique manual — se a primeira tentativa
+        // falhar (impressora offline etc.), libera a trava na hora em vez de deixar presa 90s
+        // à toa (staff geralmente tenta de novo na sequência, não faz sentido segurar).
+        else { try{const fresh=readJSON(ORDERS_FILE);const oi=fresh.findIndex(o=>o.id===order.id);if(oi>-1 && fresh[oi].autoPrintState){delete fresh[oi].autoPrintState[st];writeJSON(ORDERS_FILE,fresh);}}catch(e){} }
+        try{const log=readJSON(PRINT_LOG_FILE);log.unshift({orderId,station,error:String(printErr.message||printErr).slice(0,500),ts:new Date().toISOString(),retryable:true,method:printerCfg.method});fs.writeFileSync(PRINT_LOG_FILE,JSON.stringify(log.slice(0,500),null,2));}catch(e){}
+        return sendJSON(res, 502, { error: `Falha ao imprimir na via "${st}": ${printErr.message}`, retryable:true });
       }
     } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
   }
@@ -3909,13 +4614,13 @@ function estimateDeliveryWindow(order, cfg) {
   }
   // ── GET /api/admin/push-subscribers — quantos clientes têm push ativo (pra mostrar no painel) ──
   if (pathname === '/api/admin/push-subscribers' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'gerenciarInscritos')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const subs = readJSON(PUSH_SUBS_FILE);
     return sendJSON(res, 200, { total: subs.length, withPhone: subs.filter(s => s.phone).length });
   }
   // ── POST /api/admin/send-push — envia campanha push segmentada (todos, ou só telefones escolhidos) ──
   if (pathname === '/api/admin/send-push' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra enviar notificações.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'enviar')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra enviar notificações.' });
     try {
       const { phones, title, message, url: targetUrl, image, sound } = await readBody(req);
       const { cfg } = readConfig();
@@ -3992,13 +4697,13 @@ function estimateDeliveryWindow(order, cfg) {
   }
   // ── GET /api/admin/push/subs — lista os aparelhos da loja com alerta push ativado ──
   if (pathname === '/api/admin/push/subs' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'dispositivos', 'ver')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const subs = readJSON(ADMIN_PUSH_SUBS_FILE).map(s => ({ endpoint: s.endpoint, deviceLabel: s.deviceLabel, addedBy: s.addedBy, createdAt: s.createdAt, silent: !!s.silent }));
     return sendJSON(res, 200, { subs });
   }
   // ── POST /api/admin/push/test — manda uma notificação de teste pra todos os aparelhos ativados ──
   if (pathname === '/api/admin/push/test' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'dispositivos', 'gerenciar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const r = await sendAdminPush({ title: '🔔 Teste de alerta', body: 'Se você recebeu isso, o alerta push está funcionando neste aparelho!', url: '/painel.html', icon: '/icon-192.png', sound: 'oriental', tag: 'shogatsu-teste-push' });
     return sendJSON(res, 200, { ok: true, ...r });
   }
@@ -4012,12 +4717,12 @@ function estimateDeliveryWindow(order, cfg) {
   // ═══════════════════════════════════════════
   // ── GET /api/admin/scheduled-push — lista os agendamentos ──
   if (pathname === '/api/admin/scheduled-push' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'criar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     return sendJSON(res, 200, { items: readJSON(SCHEDULED_PUSH_FILE) });
   }
   // ── POST /api/admin/scheduled-push — cria um agendamento novo ──
   if (pathname === '/api/admin/scheduled-push' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'criar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const { title, message, image, url: targetUrl, phones, sendAll, sendAt, recurrence, intervalMinutes } = await readBody(req);
       const msg = String(message || '').slice(0, 200).trim();
@@ -4054,7 +4759,7 @@ function estimateDeliveryWindow(order, cfg) {
   }
   // ── PUT /api/admin/scheduled-push/:id — edita ou pausa/reativa um agendamento ──
   if (pathname.match(/^\/api\/admin\/scheduled-push\/[^/]+$/) && req.method === 'PUT') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'editar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const id = decodeURIComponent(pathname.split('/').pop());
       const list = readJSON(SCHEDULED_PUSH_FILE);
@@ -4080,7 +4785,7 @@ function estimateDeliveryWindow(order, cfg) {
   }
   // ── DELETE /api/admin/scheduled-push/:id ──
   if (pathname.match(/^\/api\/admin\/scheduled-push\/[^/]+$/) && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'notificacoes', 'editar')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const id = decodeURIComponent(pathname.split('/').pop());
     const list = readJSON(SCHEDULED_PUSH_FILE).filter(i => i.id !== id);
     writeJSON(SCHEDULED_PUSH_FILE, list);
@@ -4396,7 +5101,7 @@ function estimateDeliveryWindow(order, cfg) {
   // proposta PENDENTE (tipo "ficha") — não cria nada na planilha de custo sozinho. Limita a
   // poucos itens por chamada (a IA de texto é lenta pra fazer isso em massa de uma vez). ──
   if (pathname === '/api/ia/fichas/gerar-faltantes' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const body = await readBody(req).catch(() => ({}));
       const limite = Math.max(1, Math.min(8, Number(body.limite) || 5));
@@ -4460,7 +5165,7 @@ function estimateDeliveryWindow(order, cfg) {
   // ── POST /api/ia/produtos/sugerir — pede pra IA imaginar um prato novo e registra como
   // proposta PENDENTE (não mexe no cardápio). body.tema é opcional (ex: "algo com atum"). ──
   if (pathname === '/api/ia/produtos/sugerir' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'criarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const body = await readBody(req).catch(() => ({}));
       const { cfg, menu } = readConfig();
@@ -4516,7 +5221,7 @@ function estimateDeliveryWindow(order, cfg) {
   // cfg.ia.badgesAutoAprovar estiver ligado, a sugestão já entra como aprovada (aplicada na
   // hora); senão fica pendente igual as outras propostas. ──
   if (pathname === '/api/ia/badges/sugerir' && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const body = await readBody(req).catch(() => ({}));
       const janelaDias = Math.max(1, Number(body.dias) || 30);
@@ -4576,7 +5281,7 @@ function estimateDeliveryWindow(order, cfg) {
 
   // ── GET /api/ia/aprovacoes?status=pendente&tipo=novo_produto ──
   if (pathname === '/api/ia/aprovacoes' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     let lista = readJSON(APROVACOES_IA_FILE, []);
     if (query.status) lista = lista.filter(a => a.status === query.status);
     if (query.tipo) lista = lista.filter(a => a.tipo === query.tipo);
@@ -4588,7 +5293,7 @@ function estimateDeliveryWindow(order, cfg) {
   // rascunho no cardápio (item criado com available:false) em vez de publicar liberado. ──
   const aprovarMatch = pathname.match(/^\/api\/ia\/aprovacoes\/([^/]+)\/aprovar$/);
   if (aprovarMatch && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const id = aprovarMatch[1];
       const body = await readBody(req).catch(() => ({}));
@@ -4714,7 +5419,7 @@ function estimateDeliveryWindow(order, cfg) {
   // ── POST /api/ia/aprovacoes/:id/rejeitar — body: { motivo } (opcional) ──
   const rejeitarMatch = pathname.match(/^\/api\/ia\/aprovacoes\/([^/]+)\/rejeitar$/);
   if (rejeitarMatch && req.method === 'POST') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     try {
       const id = rejeitarMatch[1];
       const body = await readBody(req).catch(() => ({}));
@@ -4735,7 +5440,7 @@ function estimateDeliveryWindow(order, cfg) {
   // ── DELETE /api/ia/aprovacoes/:id — remove do histórico (limpeza manual; só itens já decididos) ──
   const aprovacaoDelMatch = pathname.match(/^\/api\/ia\/aprovacoes\/([^/]+)$/);
   if (aprovacaoDelMatch && req.method === 'DELETE') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Sem permissão.' });
+    if (!requirePermission(getToken(req, query), 'cardapio', 'editarProduto')) return sendJSON(res, 403, { error: 'Sem permissão.' });
     const id = aprovacaoDelMatch[1];
     let aprovacoes = readJSON(APROVACOES_IA_FILE, []);
     const alvo = aprovacoes.find(a => a.id === id);
@@ -4748,6 +5453,32 @@ function estimateDeliveryWindow(order, cfg) {
   // ═══════════════════════════════════════════
   // RESERVA DE MESAS
   // ═══════════════════════════════════════════
+  // v126 — NOVO ("botão pra definir que dia/horário está liberado pra reservar"): valida de
+  // verdade, no SERVIDOR, se a data/horário pedidos pra reserva estão dentro do horário
+  // liberado — antes só o navegador do cliente filtrava visualmente os horários (só mostrava
+  // botões dentro do expediente), mas nada impedia uma chamada direta à API com qualquer
+  // data/horário (inclusive um dia fechado ou 3h da manhã). Usa cfg.reservations.schedule
+  // (ou cfg.weekSchedule, se "usar mesmo horário da loja" estiver ligado) + a lista de datas
+  // bloqueadas (feriado, evento fechado etc.).
+  function isReservationSlotAvailable(cfg, dateStr, timeStr) {
+    if (!dateStr || !timeStr) return { ok: false, error: 'Escolha data e horário.' };
+    if (cfg.reservations.blockedDates && cfg.reservations.blockedDates.includes(dateStr)) {
+      return { ok: false, error: 'Essa data não está disponível pra reserva.' };
+    }
+    const effectiveSchedule = cfg.reservations.useStoreSchedule ? cfg.weekSchedule : cfg.reservations.schedule;
+    const weekday = new Date(dateStr + 'T00:00:00').getDay();
+    const daySchedule = effectiveSchedule && effectiveSchedule[weekday];
+    if (!daySchedule || daySchedule.open === false) {
+      return { ok: false, error: 'A loja não aceita reserva nesse dia da semana.' };
+    }
+    const toMin = t => { const [h, m] = String(t || '0:0').split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+    const t = toMin(timeStr);
+    const openM = toMin(daySchedule.openTime || '18:00'), closeM = toMin(daySchedule.closeTime || '23:00');
+    if (t < openM || t > closeM - 30) {
+      return { ok: false, error: `Escolha um horário entre ${daySchedule.openTime || '18:00'} e ${daySchedule.closeTime || '23:00'}.` };
+    }
+    return { ok: true };
+  }
   // ── POST /api/reservations — cliente pede uma reserva (fica pendente até a loja confirmar) ──
   if (pathname === '/api/reservations' && req.method === 'POST') {
     try {
@@ -4762,6 +5493,8 @@ function estimateDeliveryWindow(order, cfg) {
       if (!name || !phone) return sendJSON(res, 400, { error: 'Informe nome e telefone.' });
       if (!date || !time) return sendJSON(res, 400, { error: 'Escolha data e horário.' });
       if (!people) return sendJSON(res, 400, { error: 'Informe quantas pessoas.' });
+      const slotCheck = isReservationSlotAvailable(cfg, date, time);
+      if (!slotCheck.ok) return sendJSON(res, 400, { error: slotCheck.error });
       const maxP = Number(cfg.reservations.maxPeoplePerTable) || 12;
       if (people > maxP) return sendJSON(res, 400, { error: `Pra grupos maiores que ${maxP} pessoas, fale direto com a loja pelo WhatsApp.` });
       const list = readJSON(RESERVATIONS_FILE);
@@ -4772,6 +5505,24 @@ function estimateDeliveryWindow(order, cfg) {
         // (Configurações → 🏪 Restaurante → 🤖 Automações). Quando ligado, a reserva já nasce
         // confirmada, sem precisar ninguém clicar em "Confirmar" no painel.
         status: cfg.autoAcceptReservations ? 'confirmada' : 'pendente',
+        // v126 — BUG CORRIGIDO ("reserva imprimia mesmo com aceite automático desligado"): esse
+        // campo usava `cfg.print` (só o interruptor GERAL de impressão automática), igual a
+        // impressão automática de PEDIDO usava até a v91 — e foi corrigido lá pra usar
+        // `cfg.autoAcceptOrders` na v92 (ver comentário logo abaixo, perto do broadcast de
+        // 'new-order'), pelo mesmo motivo: sem o aceite automático ligado, a reserva fica
+        // pendente esperando alguém CONFIRMAR manualmente no painel, e imprimir sozinha nesse
+        // caso desperdiça papel se a loja recusar a reserva depois. Reserva nunca recebeu o
+        // mesmo ajuste — ficou usando só `cfg.print` até agora. Corrigido pra espelhar o padrão
+        // de pedido: só marca elegível pra impressão automática quando o aceite automático de
+        // RESERVA (`cfg.autoAcceptReservations`) também está ligado. Diferente de pedido (que só
+        // pode ser CRIADO com a loja aberta — cfg.open já trava lá em cima), reserva continua
+        // podendo ser criada com a loja fechada de propósito (é o que permite reservar um dia
+        // futuro com antecedência — ver o novo botão "📅 Nova Reserva" no painel), então aqui
+        // cfg.open também entra direto na conta: se a reserva foi criada com a loja fechada,
+        // ela não nasce elegível pra impressão automática (nem agora nem quando o Agente Local
+        // reconectar depois via fila de recuperação) — só uma reserva criada com a loja já
+        // aberta é que sai sozinha na impressora.
+        autoPrintEligible: !!(cfg.autoAcceptReservations && Number(cfg.open)),
         name, phone, people, date, time,
         notes: String(body.notes || '').slice(0, 200),
         storeReply: '' // v33: mensagem da loja pro cliente (aparece na tela de acompanhamento)
@@ -4784,7 +5535,15 @@ function estimateDeliveryWindow(order, cfg) {
       // "caixa" (é quem normalmente recebe o cliente/atende a reserva). Se essa via estiver
       // desativada ou sem impressora configurada, simplesmente não imprime nada (sem erro pro
       // cliente) — a reserva já foi salva e confirmada normalmente de qualquer jeito.
-      if (Number(cfg.print)) {
+      // v126 — reforçado: além do interruptor geral (cfg.print), agora só imprime de verdade
+      // se reservation.autoPrintEligible for true — ou seja, loja ABERTA agora (cfg.open) E
+      // aceite automático de reserva ligado (cfg.autoAcceptReservations), calculado ali em
+      // cima na criação do objeto (mesma regra pedida pra pedido também). A reserva continua
+      // sendo CRIADA normalmente mesmo com a loja fechada (é assim que dá pra reservar com
+      // antecedência pra um dia futuro, ver o botão "📅 Nova Reserva" no painel); só não sai
+      // sozinha na impressora se tiver nascido fora do horário de funcionamento ou sem o
+      // aceite automático ligado — nesses casos a loja confirma/imprime manualmente depois.
+      if (Number(cfg.print) && reservation.autoPrintEligible) {
         const printerCfg = cfg.stations && cfg.stations.caixa;
         if (printerCfg && printerCfg.active !== false) {
           try {
@@ -4867,6 +5626,14 @@ function estimateDeliveryWindow(order, cfg) {
 
   if (pathname === '/api/orders' && req.method === 'POST') {
     try {
+      // v109: só entra aqui a checagem de permissão se for uma chamada LOGADA (pedido manual
+      // batido pelo operador dentro do painel) — o cliente final faz pedido pelo site sem
+      // nenhum login, então uma chamada sem token continua liberada normalmente (senão
+      // quebraria o cardápio público). "pedidos.criar" só se aplica a quem já está logado.
+      const staffSession = getSession(getToken(req, query));
+      if (staffSession && !hasPermission(staffSession, 'pedidos', 'criar')) {
+        return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra criar pedidos.' });
+      }
       const body = await readBody(req);
       const { cfg, menu } = readConfig();
       if (!Number(cfg.open)) return sendJSON(res, 400, { error: 'Restaurante fechado no momento.' });
@@ -4971,6 +5738,10 @@ function estimateDeliveryWindow(order, cfg) {
         ticketNumber: null, // só é atribuído quando a loja ACEITA o pedido (veja PATCH /api/orders/:id)
         createdAt: new Date().toISOString(),
         status: 'novo',
+        // v125-part1: marca no próprio pedido se ele nasceu elegível para impressão automática.
+        // Isso permite recuperar pedidos perdidos durante uma queda de SSE/rede sem imprimir
+        // pedidos que só foram aceitos manualmente depois.
+        autoPrintEligible: !!cfg.autoAcceptOrders,
         autoPrinted: {}, // v86: ver POST /api/print — evita a mesma via imprimir 2-3x com vários painéis abertos
         mode: body.mode === 'retirada' ? 'retirada' : 'delivery',
         name: String(body.name || '').slice(0, 80),
@@ -5087,7 +5858,7 @@ function estimateDeliveryWindow(order, cfg) {
       // antes de alguém olhar. O Agente Local agora só imprime automaticamente quando essa
       // flag vier true; a impressão manual (botão "🖨 Imprimir" no painel) continua funcionando
       // sempre, com ou sem aceite automático ligado.
-      broadcast('new-order', { ...order, _printFontSize: cfg.printSize, _autoAcceptOn: !!cfg.autoAcceptOrders });
+      broadcast('new-order', { ...order, _printFontSize: cfg.printSize, _autoAcceptOn: !!cfg.autoAcceptOrders, _deliveryWindow: estimateDeliveryWindow(order, cfg) });
       // v79: alerta push pra loja em todos os aparelhos ativados (PC + celular simultâneo) —
       // além do som/SSE de quem já está com o painel aberto na tela. Não trava a resposta ao
       // cliente: dispara e segue (a função nunca rejeita, então não precisa de .catch aqui).
@@ -5110,7 +5881,9 @@ function estimateDeliveryWindow(order, cfg) {
 
   // ── GET /api/orders — lista pedidos (painel, requer auth) ──
   if (pathname === '/api/orders' && req.method === 'GET') {
-    if (!checkAuth(getToken(req, query))) return sendJSON(res, 401, { error: 'unauthorized' });
+    const session = getSession(getToken(req, query));
+    if (!session) return sendJSON(res, 401, { error: 'unauthorized' });
+    if (!hasPermission(session, 'pedidos', 'ver')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver os pedidos.' });
     return sendJSON(res, 200, readJSON(ORDERS_FILE));
   }
 
@@ -5253,7 +6026,7 @@ function estimateDeliveryWindow(order, cfg) {
 
   // ── GET /api/admin/delete-log — histórico de exclusões de pedidos (só master) ──
   if (pathname === '/api/admin/delete-log' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'master')) return sendJSON(res, 403, { error: 'Só o usuário master pode ver o histórico de exclusões.' });
+    if (!requirePermission(getToken(req, query), 'sistema', 'logs')) return sendJSON(res, 403, { error: 'Só o usuário master pode ver o histórico de exclusões.' });
     return sendJSON(res, 200, { log: readJSON(DELETE_LOG_FILE) });
   }
 
@@ -5434,7 +6207,7 @@ function estimateDeliveryWindow(order, cfg) {
 
   // ── GET /api/admin/reviews — todas as avaliações (inclusive ocultas), pra moderação ──
   if (pathname === '/api/admin/reviews' && req.method === 'GET') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver as avaliações.' });
+    if (!requirePermission(getToken(req, query), 'relatorios', 'ver')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra ver as avaliações.' });
     const orders = readJSON(ORDERS_FILE);
     const reviews = orders
       .filter(o => o.review)
@@ -5445,7 +6218,7 @@ function estimateDeliveryWindow(order, cfg) {
 
   // ── PATCH /api/admin/reviews/:orderId — oculta ou reexibe uma avaliação ──
   if (pathname.match(/^\/api\/admin\/reviews\/[^/]+$/) && req.method === 'PATCH') {
-    if (!requireRole(getToken(req, query), 'admin')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra moderar avaliações.' });
+    if (!requirePermission(getToken(req, query), 'restaurante', 'editarInformacoes')) return sendJSON(res, 403, { error: 'Seu usuário não tem permissão pra moderar avaliações.' });
     const orderId = pathname.split('/').pop();
     try {
       const { hidden } = await readBody(req);

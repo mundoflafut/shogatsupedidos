@@ -1,6 +1,6 @@
 {
   "name": "shogatsu-pedidos",
-  "version": "66.0.0",
+  "version": "1.0.133",
   "description": "Sistema de pedidos online do Shogatsu (cardápio + painel da cozinha em tempo real)",
   "main": "server.js",
   "scripts": {
