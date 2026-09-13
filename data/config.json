@@ -3,43 +3,33 @@
     "whats": "552227641333",
     "storePhone": "(22) 2764-1333",
     "fee": 8,
-    "min": 40,
+    "min": 60,
     "name": "Shogatsu Culinária Oriental",
     "days": "Ter–Dom",
-    "time": "35–65 min",
-    "timeRetirada": "25–35 min",
+    "time": "40–60 min",
+    "timeRetirada": "20–30 min",
     "addr": "Av. Gov. Roberto Silveira, 109 · Costazul · Rio das Ostras · CEP 22896-155",
     "hours": "18h30–23h",
     "open": 1,
     "schedule": {
       "enabled": false,
-      "openTime": "18:30",
+      "openTime": "18:00",
       "closeTime": "23:00"
     },
     "weekSchedule": [
       {
         "open": true,
-        "openTime": "18:30",
+        "openTime": "18:00",
         "closeTime": "23:00"
       },
       {
         "open": false,
-        "openTime": "18:30",
+        "openTime": "18:00",
         "closeTime": "23:00"
       },
       {
         "open": true,
-        "openTime": "18:30",
-        "closeTime": "23:00"
-      },
-      {
-        "open": true,
-        "openTime": "18:30",
-        "closeTime": "23:00"
-      },
-      {
-        "open": true,
-        "openTime": "18:30",
+        "openTime": "18:00",
         "closeTime": "23:00"
       },
       {
@@ -50,7 +40,17 @@
       {
         "open": true,
         "openTime": "18:00",
-        "closeTime": "23:30"
+        "closeTime": "23:00"
+      },
+      {
+        "open": true,
+        "openTime": "18:00",
+        "closeTime": "23:00"
+      },
+      {
+        "open": true,
+        "openTime": "18:00",
+        "closeTime": "23:00"
       }
     ],
     "adminPass": "shogatsu2026",
@@ -61,11 +61,6 @@
         "password": "shogatsuMaster2026",
         "role": "master"
       },
-      {
-        "username": "caixa",
-        "password": "1234",
-        "role": "caixa"
-      }, 
       {
         "username": "admin",
         "password": "shogatsu2026",
