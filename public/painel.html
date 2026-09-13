@@ -2518,13 +2518,19 @@ body{font-size:13px;letter-spacing:-.01em;}
 <div class="item-editor-card item-editor-section">
 <div class="item-editor-section-title"><span>📸 Foto do produto</span><span class="item-photo-meta" id="item-photo-status">Recomendado: imagem nítida e bem iluminada</span></div>
 <div class="item-editor-section-sub">A foto é o destaque principal do produto. Você pode trocar ou remover quando quiser.</div>
-<div class="item-photo-hero" id="item-photo-wrap" onclick="document.getElementById('item-photo-file').click()">
+<!-- v135 — REFORÇADO ("clique não faz nada" — segundo caso desse tipo relatado, sem
+     conseguir reproduzir isolado em teste automatizado): trocado de <div onclick="...
+     .click()"> pra <label for="item-photo-file">, que abre o seletor de arquivo por
+     mecanismo NATIVO do HTML/navegador — funciona mesmo que algum erro de JavaScript em
+     outro lugar da página quebre o onclick (que continua aqui também, como reforço extra,
+     não custa nada ter os dois). -->
+<label class="item-photo-hero" for="item-photo-file" id="item-photo-wrap">
 <img alt="Foto do produto" class="photo-preview" id="item-photo-preview"/>
 <div class="item-photo-empty" id="item-photo-placeholder"><span class="big">🍽️</span><strong>Adicionar foto do produto</strong><span>JPG, PNG ou WEBP • toque aqui ou use o botão abaixo</span></div>
-</div>
+</label>
 <div class="item-photo-actions">
 <input accept="image/png,image/jpeg,image/webp" id="item-photo-file" onchange="uploadItemPhoto(this)" type="file"/>
-<button class="btn primary sm" onclick="document.getElementById('item-photo-file').click()" type="button">📷 Escolher foto</button>
+<label class="btn primary sm" for="item-photo-file" style="cursor:pointer;">📷 Escolher foto</label>
 <button class="btn secondary sm" onclick="removeItemPhoto()" type="button">🗑 Remover</button>
 </div>
 <div id="item-photo-pos-wrap" style="display:none;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);">
@@ -7819,24 +7825,31 @@ function menuItemCardHTML(sec,si,item,ii,allowReorder){
       </div>`;
 }
 // v76: trocar a foto de um prato direto pelo card, sem abrir a edição completa (edição rápida).
+// v135 — reforço defensivo: se input.click() ou qualquer passo daqui falhar silenciosamente
+// por algum motivo do navegador, mostra um aviso em vez de "não acontecer nada" sem pista.
 function quickChangeItemPhoto(si,ii){
-  const input=document.createElement('input');
-  input.type='file'; input.accept='image/png,image/jpeg,image/webp';
-  input.onchange=async ()=>{
-    const file=input.files&&input.files[0];
-    if(!file) return;
-    let dataUrl;
-    try{ dataUrl=await compressImageFile(file); }
-    catch(e){ dataUrl=await new Promise((resolve,reject)=>{ const r=new FileReader(); r.onload=()=>resolve(r.result); r.onerror=reject; r.readAsDataURL(file); }); }
-    const res=await apiPost('/api/upload', { dataUrl });
-    if(!res.ok){ alert(res.data.error||'Erro ao enviar a foto.'); return; }
-    menu[si].items[ii].image = res.data.url;
-    const saveRes = await apiPost('/api/config', { cfg, menu });
-    if(!saveRes.ok){ alert(saveRes.data.error||'Erro ao salvar.'); return; }
-    renderMenuItems();
-    showToast('📷 Foto atualizada', menu[si].items[ii].name);
-  };
-  input.click();
+  try{
+    const input=document.createElement('input');
+    input.type='file'; input.accept='image/png,image/jpeg,image/webp';
+    input.onchange=async ()=>{
+      const file=input.files&&input.files[0];
+      if(!file) return;
+      let dataUrl;
+      try{ dataUrl=await compressImageFile(file); }
+      catch(e){ dataUrl=await new Promise((resolve,reject)=>{ const r=new FileReader(); r.onload=()=>resolve(r.result); r.onerror=reject; r.readAsDataURL(file); }); }
+      const res=await apiPost('/api/upload', { dataUrl });
+      if(!res.ok){ alert(res.data.error||'Erro ao enviar a foto.'); return; }
+      menu[si].items[ii].image = res.data.url;
+      const saveRes = await apiPost('/api/config', { cfg, menu });
+      if(!saveRes.ok){ alert(saveRes.data.error||'Erro ao salvar.'); return; }
+      renderMenuItems();
+      showToast('📷 Foto atualizada', menu[si].items[ii].name);
+    };
+    input.click();
+  } catch(e) {
+    console.error('quickChangeItemPhoto falhou:', e);
+    if(typeof showToast==='function') showToast('⚠️ Não consegui abrir o seletor de foto', 'Tente recarregar a página (F5) — se persistir, use "✏️ Editar prato" pra trocar a foto por lá.', 6000);
+  }
 }
 // v76: arrastar-e-soltar pra reordenar os itens dentro da categoria atual (além dos botões ▲▼).
 function setupItemDragDrop(){
