@@ -499,6 +499,10 @@ function writeJSON(file, data) {
 const SUPABASE_URL = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'shogatsu_kv';
+// v137 — fotos do cardápio no Supabase Storage (sem Base64 no banco).
+// O bucket já existente no projeto pode ser informado no Render; por padrão usamos o nome
+// criado para o cardápio. Não use a service_role no navegador: ela fica somente no servidor.
+const SUPABASE_STORAGE_BUCKET = 'BANCO DE FOTS';
 const FILE_TO_KEY = { [ORDERS_FILE]: 'orders', [CONFIG_FILE]: 'config', [CUSTOMERS_FILE]: 'customers', [RESERVATIONS_FILE]: 'reservations', [PUSH_SUBS_FILE]: 'push_subs', [ADMIN_PUSH_SUBS_FILE]: 'admin_push_subs', [SCHEDULED_PUSH_FILE]: 'scheduled_push', [COURIERS_FILE]: 'couriers', [DELETE_LOG_FILE]: 'delete_log', [PERMISSION_LOG_FILE]: 'permission_log', [INGREDIENTES_FILE]: 'ingredientes', [FICHAS_TECNICAS_FILE]: 'fichas_tecnicas', [CUSTOS_CONFIG_FILE]: 'custos_config', [SESSIONS_FILE]: 'sessions', [APROVACOES_IA_FILE]: 'aprovacoes_ia' };
 
 function supabaseRequest(method, subpath, body) {
@@ -630,11 +634,102 @@ async function restoreFromSupabase() {
 // Persistente pago pra não perder fotos. Vídeos (Live Photo) ficam de fora desse backup (arquivo
 // grande demais pra guardar como texto no banco com folga de sobra) — pra esses, o Disco
 // Persistente do Render continua sendo a única forma garantida de não perder o arquivo.
-function syncUploadToSupabase(filename, buffer, ext) {
+// v137 — Storage de imagens. Upload é feito diretamente do servidor para o bucket público.
+// Isso elimina o backup Base64 das fotos dentro de shogatsu_kv, que fazia o conteúdo inteiro da
+// imagem viajar pelo banco e depois voltar a cada restauração. O arquivo local continua sendo
+// gravado como fallback, mas o URL devolvido ao painel passa a ser o URL público do Storage.
+function storagePublicUrl(filename) {
+  const bucket = SUPABASE_STORAGE_BUCKET.split('/').map(encodeURIComponent).join('/');
+  const objectPath = String(filename).split('/').map(encodeURIComponent).join('/');
+  return `${SUPABASE_URL}/storage/v1/object/public/${bucket}/${objectPath}`;
+}
+function supabaseStorageUpload(filename, buffer, mimeType) {
+  return new Promise((resolve, reject) => {
+    if (!SUPABASE_URL || !SUPABASE_KEY) return reject(new Error('Supabase Storage não configurado'));
+    const bucket = SUPABASE_STORAGE_BUCKET.split('/').map(encodeURIComponent).join('/');
+    const objectPath = String(filename).split('/').map(encodeURIComponent).join('/');
+    const u = new URL(`${SUPABASE_URL}/storage/v1/object/${bucket}/${objectPath}`);
+    const req = https.request(u, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${SUPABASE_KEY}`,
+        'apikey': SUPABASE_KEY,
+        'Content-Type': mimeType || 'application/octet-stream',
+        'Content-Length': buffer.length,
+        'x-upsert': 'true'
+      },
+      timeout: 15000
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) return resolve(storagePublicUrl(filename));
+        reject(new Error(`Storage HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Storage timeout')); });
+    req.end(buffer);
+  });
+}
+
+function collectLegacyUploadRefs(value, out = new Set()) {
+  if (typeof value === 'string') {
+    const m = value.match(/(?:^|\/)uploads\/([^?#'"\s]+)/i);
+    if (m && m[1]) out.add(decodeURIComponent(m[1]));
+  } else if (Array.isArray(value)) {
+    value.forEach(v => collectLegacyUploadRefs(v, out));
+  } else if (value && typeof value === 'object') {
+    Object.values(value).forEach(v => collectLegacyUploadRefs(v, out));
+  }
+  return out;
+}
+
+function replaceLegacyUploadRefs(value, publicUrls) {
+  if (typeof value === 'string') {
+    return value.replace(/(^|\/)uploads\/([^?#'"\s]+)/ig, (all, prefix, filename) => {
+      const clean = decodeURIComponent(filename);
+      return publicUrls.get(clean) || all;
+    });
+  }
+  if (Array.isArray(value)) return value.map(v => replaceLegacyUploadRefs(v, publicUrls));
+  if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) value[k] = replaceLegacyUploadRefs(v, publicUrls);
+  }
+  return value;
+}
+
+// v137 — migra as fotos antigas já restauradas em uploads/ para o Storage e troca somente as
+// referências /uploads/... no config. É executada depois da restauração do backup, portanto as
+// 157 fotos da v136 continuam aproveitáveis sem exigir que o usuário faça upload novamente.
+async function migrateConfigImagesToStorage() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
-  const key = 'upload_' + filename;
-  supabaseRequest('POST', `${SUPABASE_TABLE}?on_conflict=key`, { key, value: { ext, b64: buffer.toString('base64') }, updated_at: new Date().toISOString() })
-    .catch(err => console.error(`⚠️  Falha ao fazer backup da foto "${filename}" no Supabase:`, err.message));
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) return;
+    const cfg = readJSON(CONFIG_FILE);
+    const refs = [...collectLegacyUploadRefs(cfg)];
+    if (!refs.length) return;
+    const publicUrls = new Map();
+    let migrated = 0;
+    for (const filename of refs) {
+      const filePath = path.join(UPLOADS_DIR, path.basename(filename));
+      if (!fs.existsSync(filePath)) {
+        console.warn(`   ⚠️  Foto antiga não encontrada localmente: ${filename}`);
+        continue;
+      }
+      const ext = path.extname(filename).toLowerCase();
+      const mime = { '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.png':'image/png', '.webp':'image/webp', '.gif':'image/gif' }[ext] || 'application/octet-stream';
+      const publicUrl = await supabaseStorageUpload(path.basename(filename), fs.readFileSync(filePath), mime);
+      publicUrls.set(filename, publicUrl);
+      migrated++;
+    }
+    if (!publicUrls.size) return;
+    const updated = replaceLegacyUploadRefs(cfg, publicUrls);
+    writeJSON(CONFIG_FILE, updated);
+    console.log(`   ✓ ${migrated} foto(s) do cardápio migrada(s) para Supabase Storage → ${SUPABASE_STORAGE_BUCKET}`);
+  } catch (err) {
+    console.error('   ⚠️  Não consegui migrar fotos para o Supabase Storage:', err.message);
+  }
 }
 // v107 — REDUÇÃO DE BANDWIDTH (causa raiz do consumo alto de "Service-Initiated"): antes, essa
 // função baixava o CONTEÚDO (base64) de TODAS as fotos já enviadas de uma vez só — mesmo das que
@@ -3167,7 +3262,18 @@ async function handleRequest(req, res) {
       if (buffer.length > maxBytes) return sendJSON(res, 400, { error: mVideo ? 'Vídeo muito grande (máx. 15MB).' : mAudio ? 'Áudio muito grande (máx. 6MB).' : 'Imagem muito grande (máx. 4MB).' });
       const filename = crypto.randomBytes(8).toString('hex') + '.' + ext;
       fs.writeFileSync(path.join(UPLOADS_DIR, filename), buffer);
-      if (mImg) syncUploadToSupabase(filename, buffer, ext); // v60: só imagens fazem backup (vídeo é grande demais)
+      if (mImg) {
+        try {
+          const mimeType = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+          const publicUrl = await supabaseStorageUpload(filename, buffer, mimeType);
+          return sendJSON(res, 200, { url: publicUrl, storage: true });
+        } catch (storageErr) {
+          // Fallback seguro: se o Storage estiver mal configurado, o upload local continua
+          // funcionando e a foto não desaparece do painel. A migração poderá tentar novamente.
+          console.error(`⚠️  Storage indisponível para a foto "${filename}":`, storageErr.message);
+          return sendJSON(res, 200, { url: '/uploads/' + filename, storage: false, storageError: storageErr.message });
+        }
+      }
       return sendJSON(res, 200, { url: '/uploads/' + filename });
     } catch (e) { return sendJSON(res, 400, { error: 'invalid body' }); }
   }
@@ -6442,7 +6548,17 @@ server.listen(PORT, () => {
     console.log('⚠️  ATENÇÃO: UPLOADS_DIR não configurado e Supabase não configurado — fotos enviadas podem se perder no próximo deploy. Configure um Disco Persistente (UPLOADS_DIR) ou SUPABASE_URL/SUPABASE_SERVICE_KEY. Veja o README.md.');
   }
 });
-restoreFromSupabase().finally(() => {
+restoreFromSupabase().finally(async () => {
   loadSessionsFromDisk(); // v60: depois de restaurar do Supabase (se configurado), carrega sessões válidas pra memória
-  restoreUploadsFromSupabase();
+  // v137: só usa o antigo backup Base64 de fotos se ainda existirem referências /uploads/ no
+  // config. Depois da primeira migração para Storage, os próximos deploys não precisam mais
+  // baixar as 157+ fotos do banco, reduzindo fortemente o Egress.
+  let precisaMigrarFotos = false;
+  try {
+    if (fs.existsSync(CONFIG_FILE)) precisaMigrarFotos = collectLegacyUploadRefs(readJSON(CONFIG_FILE)).size > 0;
+  } catch (e) {}
+  if (precisaMigrarFotos) {
+    await restoreUploadsFromSupabase();
+    await migrateConfigImagesToStorage();
+  }
 });
