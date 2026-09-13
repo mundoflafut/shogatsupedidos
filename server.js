@@ -688,46 +688,75 @@ async function loadSupabaseMenuSources() {
   return out;
 }
 
+function mergeMenusPreservingUpdates(baseMenu, extraMenu) {
+  const base = Array.isArray(baseMenu) ? JSON.parse(JSON.stringify(baseMenu)) : [];
+  const extra = Array.isArray(extraMenu) ? extraMenu : [];
+  const catKey = c => String(c && (c.id || c.title || c.name || '')).trim().toLowerCase();
+  const itemKey = it => String(it && (it.id || it.name || it.title || '')).trim().toLowerCase();
+  const byCat = new Map();
+  base.forEach((c, i) => { const k = catKey(c); if (k) byCat.set(k, i); });
+  for (const ec of extra) {
+    const k = catKey(ec);
+    let idx = k ? byCat.get(k) : undefined;
+    if (idx === undefined) {
+      idx = base.length;
+      base.push(JSON.parse(JSON.stringify(ec)));
+      if (!Array.isArray(base[idx].items)) base[idx].items = [];
+      if (k) byCat.set(k, idx);
+      continue;
+    }
+    const dst = base[idx];
+    if (!Array.isArray(dst.items)) dst.items = [];
+    const itemMap = new Map();
+    dst.items.forEach((it, j) => { const ik = itemKey(it); if (ik) itemMap.set(ik, j); });
+    for (const ei of (Array.isArray(ec.items) ? ec.items : [])) {
+      const ik = itemKey(ei);
+      if (!ik || !itemMap.has(ik)) {
+        dst.items.push(JSON.parse(JSON.stringify(ei)));
+        if (ik) itemMap.set(ik, dst.items.length - 1);
+      }
+      // Item already in the current config wins: this preserves newer edits (price,
+      // description, availability, badge, options, photo position, etc.).
+    }
+  }
+  return base;
+}
+
 async function restoreLegacyMenuIfNeeded() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return false;
   try {
     const raw = readJSON(CONFIG_FILE);
     const currentMenu = raw && Array.isArray(raw.menu) ? raw.menu : [];
+    const currentCount = menuItemCount(currentMenu);
     const defaultMenuText = JSON.stringify(DEFAULT_MENU);
     const currentIsDefault = JSON.stringify(currentMenu) === defaultMenuText;
-    const currentCount = menuItemCount(currentMenu);
     const sources = await loadSupabaseMenuSources();
+    const candidates = [];
+    if (sources.legacy && Array.isArray(sources.legacy.menu)) candidates.push(sources.legacy.menu);
+    const tableMenu = normalizeLegacyTableMenu(sources.categories, sources.items);
+    if (tableMenu) candidates.push(tableMenu);
 
-    // 1) Chave legada separada tem prioridade quando o menu local é vazio/padrão.
-    if (sources.legacy && (currentCount === 0 || currentIsDefault)) {
-      const merged = { ...(raw || {}), menu: sources.legacy.menu };
+    let mergedMenu = currentMenu;
+    if (currentCount === 0 || currentIsDefault) {
+      // When the ZIP contains only the factory menu, prefer the real Supabase menu,
+      // then union any other legacy source so no old item is lost.
+      mergedMenu = [];
+      for (const candidate of candidates) mergedMenu = mergeMenusPreservingUpdates(mergedMenu, candidate);
+      if (!mergedMenu.length) mergedMenu = currentMenu;
+    } else {
+      // The live config is authoritative for existing items, but legacy tables/keys may
+      // contain products that are missing from it. Union them instead of replacing anything.
+      for (const candidate of candidates) mergedMenu = mergeMenusPreservingUpdates(mergedMenu, candidate);
+    }
+
+    const mergedCount = menuItemCount(mergedMenu);
+    if (mergedCount > 0 && JSON.stringify(mergedMenu) !== JSON.stringify(currentMenu)) {
+      const merged = { ...(raw || {}), menu: mergedMenu };
       writeJSON(CONFIG_FILE, merged);
-      console.log(`   ✓ Cardápio legado restaurado da chave Supabase "${sources.legacy.key}": ${menuItemCount(sources.legacy.menu)} prato(s)`);
+      console.log(`   ✓ Cardápio reconciliado do Supabase: ${mergedCount} prato(s), sem substituir atualizações existentes`);
       return true;
     }
-
-    // 2) As tabelas menu_categories/menu_items são a fonte de recuperação das versões antigas.
-    // Só substituímos o config quando elas têm mais dados, ou quando são comprovadamente mais
-    // recentes. Assim, uma edição nova feita pelo painel (que salva em shogatsu_kv/config) não
-    // é sobrescrita por uma tabela antiga.
-    const tableMenu = normalizeLegacyTableMenu(sources.categories, sources.items);
-    if (tableMenu && menuItemCount(tableMenu) > 0) {
-      const tableCount = menuItemCount(tableMenu);
-      let configUpdatedAt = 0;
-      try {
-        const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.config&select=updated_at`);
-        configUpdatedAt = newestTimestamp(rows);
-      } catch (e) {}
-      const tableUpdatedAt = Math.max(newestTimestamp(sources.categories), newestTimestamp(sources.items));
-      const shouldUseTables = currentCount === 0 || currentIsDefault || tableCount > currentCount || (tableUpdatedAt > 0 && tableUpdatedAt > configUpdatedAt);
-      if (shouldUseTables) {
-        const merged = { ...(raw || {}), menu: tableMenu };
-        writeJSON(CONFIG_FILE, merged);
-        console.log(`   ✓ Cardápio recuperado das tabelas menu_categories/menu_items: ${tableCount} prato(s)${tableUpdatedAt > configUpdatedAt && tableUpdatedAt ? ' — fonte mais recente' : ''}`);
-        return true;
-      }
-      console.log(`   ✓ Cardápio do config preservado: ${currentCount} prato(s); tabelas antigas têm ${tableCount}`);
-    }
+    console.log(`   ✓ Cardápio Supabase conferido: ${currentCount} prato(s) no config${tableMenu ? `; ${menuItemCount(tableMenu)} prato(s) nas tabelas legadas` : ''}`);
   } catch (e) {
     console.error('   ⚠️  Falha ao procurar cardápio legado:', e.message);
   }
@@ -842,32 +871,37 @@ async function migrateConfigImagesToStorage() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   try {
     if (!fs.existsSync(CONFIG_FILE)) return;
+    console.log('   🔎 Verificando fotos antigas do cardápio no Supabase...');
     const cfg = readJSON(CONFIG_FILE);
-    const keyRows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=ilike.upload_*&select=key`);
     const names = new Set();
+    // O endpoint REST do PostgREST pagina por padrão. 1000 é suficiente para este
+    // projeto e evita perder fotos depois da 100ª linha.
+    const keyRows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=ilike.upload_*&select=key&limit=1000`);
     for (const row of (keyRows || [])) {
       const key = String(row.key || '');
       if (key.startsWith('upload_')) names.add(key.slice('upload_'.length));
     }
-    for (const ref of collectLegacyUploadRefs(cfg)) names.add(ref);
-    // Fotos também podem estar referenciadas diretamente nas tabelas antigas.
+    collectLegacyUploadRefs(cfg, names);
     try {
-      const rows = await supabaseRequest('GET', 'menu_items?select=*');
+      const rows = await supabaseRequest('GET', 'menu_items?select=*&limit=1000');
       for (const item of (rows || [])) {
-        collectLegacyUploadRefs(item.image || item.photo || item.foto || item.image_url || item.photo_url || item.foto_url, names);
+        collectLegacyUploadRefs(item, names);
       }
-    } catch (e) {}
-    if (!names.size) return;
+    } catch (e) {
+      console.warn('   ⚠️  Não consegui consultar menu_items para localizar fotos:', e.message);
+    }
+    if (!names.size) {
+      console.log('   ℹ️  Nenhuma foto legada encontrada para migrar.');
+      return;
+    }
 
     async function storageObjectExists(filename) {
       try {
         const u = new URL(storagePublicUrl(filename));
         return await new Promise(resolve => {
-          const rr = https.request(u, {
-            method: 'HEAD',
-            headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
-            timeout: 8000
-          }, r => { r.resume(); r.on('end', () => resolve(r.statusCode >= 200 && r.statusCode < 300)); });
+          const rr = https.request(u, { method: 'HEAD', headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }, timeout: 8000 }, r => {
+            r.resume(); r.on('end', () => resolve(r.statusCode >= 200 && r.statusCode < 300));
+          });
           rr.on('error', () => resolve(false));
           rr.on('timeout', () => { rr.destroy(); resolve(false); });
           rr.end();
@@ -878,29 +912,26 @@ async function migrateConfigImagesToStorage() {
     const publicUrls = new Map();
     let migrated = 0, alreadyThere = 0, skipped = 0;
     for (const filename of names) {
-      const cleanName = path.basename(filename);
-      if (!/^[A-Za-z0-9._-]+$/.test(cleanName)) continue;
+      const cleanName = path.basename(String(filename));
+      if (!/^[A-Za-z0-9._-]+$/.test(cleanName)) { skipped++; continue; }
       const publicUrl = storagePublicUrl(cleanName);
-
-      // Primeiro verifica o Storage. Se já estiver lá, NÃO baixa o Base64 antigo do banco.
       if (await storageObjectExists(cleanName)) {
         publicUrls.set(cleanName, publicUrl);
         publicUrls.set('upload_' + cleanName, publicUrl);
         alreadyThere++;
         continue;
       }
-
       const filePath = path.join(UPLOADS_DIR, cleanName);
       let buffer = null;
       if (fs.existsSync(filePath)) {
         buffer = fs.readFileSync(filePath);
       } else {
         try {
-          const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${encodeURIComponent('upload_' + cleanName)}&select=value`);
+          const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${encodeURIComponent('upload_' + cleanName)}&select=value&limit=1`);
           const row = rows && rows[0];
           if (row && row.value && row.value.b64) buffer = Buffer.from(row.value.b64, 'base64');
         } catch (e) {
-          console.warn(`   ⚠️  Não consegui recuperar a foto antiga ${cleanName}: ${e.message}`);
+          console.warn(`   ⚠️  Não consegui recuperar ${cleanName}: ${e.message}`);
         }
       }
       if (!buffer || !buffer.length) { skipped++; continue; }
@@ -912,21 +943,24 @@ async function migrateConfigImagesToStorage() {
         publicUrls.set(cleanName, publicUrl);
         publicUrls.set('upload_' + cleanName, publicUrl);
         migrated++;
+        if (migrated % 20 === 0) console.log(`   ↳ ${migrated} foto(s) migradas...`);
       } catch (e) {
         console.warn(`   ⚠️  Não consegui enviar ${cleanName} ao Storage: ${e.message}`);
       }
     }
-    if (publicUrls.size) {
-      const updatedCfg = replaceLegacyUploadRefs(cfg, publicUrls);
-      // Só grava se realmente houve alteração; isso evita criar uma nova sincronização de config.
-      const before = JSON.stringify(cfg);
-      const after = JSON.stringify(updatedCfg);
-      if (before !== after) writeJSON(CONFIG_FILE, updatedCfg);
-      console.log(`   ✓ Referências de fotos verificadas: ${publicUrls.size / 2} arquivo(s) no Storage`);
+
+    const updatedCfg = replaceLegacyUploadRefs(cfg, publicUrls);
+    const before = JSON.stringify(cfg);
+    const after = JSON.stringify(updatedCfg);
+    if (before !== after) {
+      writeJSON(CONFIG_FILE, updatedCfg);
+      // Confirma explicitamente o config no backup; não dependemos do debounce do shutdown.
+      await supabaseRequest('POST', `${SUPABASE_TABLE}?on_conflict=key`, { key: 'config', value: updatedCfg, updated_at: new Date().toISOString() });
     }
-    console.log(`   ✓ Storage de fotos: ${migrated} migrada(s), ${alreadyThere} já existente(s)${skipped ? `, ${skipped} indisponível(is)` : ''}`);
+    console.log(`   ✓ FOTOS DO CARDÁPIO: ${migrated} migrada(s), ${alreadyThere} já no Storage, ${skipped} sem conteúdo/compatibilidade.`);
+    console.log(`   ✓ Bucket utilizado: ${SUPABASE_STORAGE_BUCKET}`);
   } catch (err) {
-    console.error('   ⚠️  Não consegui migrar fotos para o Supabase Storage:', err.message);
+    console.error('   ⚠️  ERRO NA MIGRAÇÃO DAS FOTOS:', err.message);
   }
 }
 
@@ -6757,7 +6791,7 @@ server.listen(PORT, () => {
 });
 restoreFromSupabase().then(async () => {
   loadSessionsFromDisk(); // v60: depois de restaurar do Supabase (se configurado), carrega sessões válidas pra memória
-  // v141: verifica a migração de fotos em TODO boot, mas sem baixar Base64 quando o objeto
+  // v142: verifica a migração de fotos em TODO boot, mas sem baixar Base64 quando o objeto
   // já existe no Storage. Isso também encontra referências que ficaram apenas em menu_items.
   // O custo recorrente é somente uma consulta de nomes + HEADs leves; o conteúdo pesado só é
   // baixado uma vez, quando a foto realmente ainda não existe no Storage.
