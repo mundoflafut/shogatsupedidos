@@ -15,3 +15,12 @@ Não é necessário criar nenhuma variável nova no Render para o Storage. A ver
 - O cliente tenta novamente durante a restauração, evitando mostrar o `DEFAULT_MENU` do ZIP.
 - O servidor registra a quantidade de categorias e pratos efetivamente restaurados.
 - O bucket de fotos continua fixo em `BANCO DE FOTS`; nenhuma variável `SUPABASE_STORAGE_BUCKET` é necessária.
+
+
+## v140 — migração do cardápio antigo
+- O cardápio público aguarda a restauração do Supabase antes de responder `/api/config`, evitando exibir `default-menu.json`.
+- Se o backup antigo não tiver `menu`, procura as chaves legadas `menu`, `cardapio`, `menu_data`, `cardapio_data`, `menu_config`, `cardapio_config` em `shogatsu_kv`.
+- Como fallback, lê `menu_categories` e `menu_items` existentes no Supabase e adapta para o formato antigo do cardápio.
+- Fotos antigas `upload_*` são migradas para o bucket público `BANCO DE FOTS`; as referências do cardápio são atualizadas e o `config` corrigido volta ao Supabase.
+- Novas fotos continuam usando `/api/upload` e o Storage; `SUPABASE_STORAGE_BUCKET` não é necessário.
+- Não apagar os registros antigos `upload_*` antes de validar o cardápio e as fotos.
