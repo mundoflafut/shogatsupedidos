@@ -2621,11 +2621,19 @@ function toggleClientTheme(){
 
 async function loadConfig() {
   try {
-    const r = await fetch('/api/config');
+    // v138: o Render pode abrir a página antes de o backup do restaurante terminar de restaurar.
+    // Em vez de mostrar o menu padrão do ZIP (que pode ter menos pratos), espera e tenta novamente.
+    let r;
+    for (let tentativa = 0; tentativa < 30; tentativa++) {
+      r = await fetch('/api/config', { cache: 'no-store' });
+      if (r.status !== 503) break;
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    if (!r || !r.ok) throw new Error('config indisponível');
     const data = await r.json();
-    cfg = data.cfg; menu = data.menu;
+    cfg = data.cfg; menu = Array.isArray(data.menu) ? data.menu : [];
   } catch (e) {
-    document.getElementById('menu-main').innerHTML = '<p style="text-align:center;color:var(--muted);padding:40px;">Não foi possível carregar o cardápio. Verifique se o servidor está rodando.</p>';
+    document.getElementById('menu-main').innerHTML = '<p style="text-align:center;color:var(--muted);padding:40px;">Não foi possível carregar o cardápio. Tente atualizar a página.</p>';
     return;
   }
   applyTheme();
