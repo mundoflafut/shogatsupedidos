@@ -624,30 +624,46 @@ function menuItemCount(menu) {
 }
 
 function normalizeLegacyTableMenu(categories, items) {
-  if (!Array.isArray(categories) || !Array.isArray(items) || !categories.length || !items.length) return null;
+  if (!Array.isArray(items) || !items.length) return null;
   const get = (o, keys, fallback='') => {
     for (const k of keys) if (o && o[k] !== undefined && o[k] !== null && String(o[k]).trim() !== '') return o[k];
     return fallback;
   };
+  const out = [];
   const categoryMap = new Map();
-  const out = categories.map((c, i) => {
-    const id = String(get(c, ['id','category_id','categoryId'], `cat-${i}`));
-    const title = String(get(c, ['title','name','category_name','label'], `Categoria ${i+1}`));
-    categoryMap.set(id, i);
-    categoryMap.set(title, i);
-    return { id, icon: String(get(c, ['icon','emoji'], '🍣')), title, note: String(get(c, ['note','description','desc'], '')), items: [] };
-  });
+  const addCategory = (id, title, icon='🍣', note='') => {
+    const key = String(id || title || '').trim();
+    const titleKey = String(title || id || '').trim();
+    let idx = categoryMap.get(key) ?? categoryMap.get(titleKey);
+    if (idx !== undefined) return idx;
+    idx = out.length;
+    out.push({ id: key || `cat-${idx}`, icon: String(icon || '🍣'), title: titleKey || `Categoria ${idx+1}`, note: String(note || ''), items: [] });
+    if (key) categoryMap.set(key, idx);
+    if (titleKey) categoryMap.set(titleKey, idx);
+    categoryMap.set(titleKey.toLowerCase(), idx);
+    return idx;
+  };
+  for (const [i, c] of (Array.isArray(categories) ? categories : []).entries()) {
+    addCategory(
+      get(c, ['id','category_id','categoryId'], `cat-${i}`),
+      get(c, ['title','name','category_name','label'], `Categoria ${i+1}`),
+      get(c, ['icon','emoji'], '🍣'),
+      get(c, ['note','description','desc'], '')
+    );
+  }
+  if (!out.length) addCategory('cat-0', 'Cardápio', '🍣', '');
+
   for (const raw of items) {
-    const catRef = String(get(raw, ['category_id','categoryId','menu_category_id','category','category_name','categoryName'], ''));
-    let idx = categoryMap.get(catRef);
-    if (idx === undefined && raw && raw.category && typeof raw.category === 'object') {
-      idx = categoryMap.get(String(get(raw.category, ['id','name','title'], '')));
-    }
-    if (idx === undefined) idx = 0;
+    const catObj = raw && raw.category && typeof raw.category === 'object' ? raw.category : null;
+    const catId = String(get(raw, ['category_id','categoryId','menu_category_id','category'], '') || (catObj && get(catObj, ['id','category_id'], ''))).trim();
+    const catName = String(get(raw, ['category_name','categoryName'], '') || (catObj && get(catObj, ['name','title'], ''))).trim();
+    let idx = categoryMap.get(catId);
+    if (idx === undefined && catName) idx = categoryMap.get(catName) ?? categoryMap.get(catName.toLowerCase());
+    if (idx === undefined) idx = addCategory(catId || `cat-auto-${out.length}`, catName || 'Outros', '🍣', '');
     const priceRaw = get(raw, ['price','valor','preco','amount'], 0);
     const image = String(get(raw, ['image','photo','foto','image_url','photo_url','foto_url','imagem','imagem_url'], ''));
-    out[idx].items.push({
-      id: raw.id,
+    const item = {
+      id: String(get(raw, ['id','item_id'], crypto.randomUUID())),
       name: String(get(raw, ['name','title','nome'], 'Produto')),
       desc: String(get(raw, ['desc','description','descricao'], '')),
       price: Number(priceRaw) || 0,
@@ -657,9 +673,10 @@ function normalizeLegacyTableMenu(categories, items) {
       image,
       variants: Array.isArray(raw.variants) ? raw.variants : [],
       extras: Array.isArray(raw.extras) ? raw.extras : []
-    });
+    };
+    out[idx].items.push(item);
   }
-  return out.filter(c => c.items.length || categories.length === 1);
+  return out.filter(c => c.items.length || out.length === 1);
 }
 
 function newestTimestamp(rows) {
@@ -685,6 +702,7 @@ async function loadSupabaseMenuSources() {
   }
   try { out.categories = await supabaseRequest('GET', 'menu_categories?select=*'); } catch (e) { console.warn('   ⚠️  Não consegui ler menu_categories:', e.message); }
   try { out.items = await supabaseRequest('GET', 'menu_items?select=*'); } catch (e) { console.warn('   ⚠️  Não consegui ler menu_items:', e.message); }
+  console.log(`   ↳ Fontes de cardápio: ${out.legacy ? `chave ${out.legacy.key} (${menuItemCount(out.legacy.menu)} pratos)` : 'nenhuma chave legada'}, menu_categories=${out.categories.length}, menu_items=${out.items.length}`);
   return out;
 }
 
@@ -734,7 +752,12 @@ async function restoreLegacyMenuIfNeeded() {
     const candidates = [];
     if (sources.legacy && Array.isArray(sources.legacy.menu)) candidates.push(sources.legacy.menu);
     const tableMenu = normalizeLegacyTableMenu(sources.categories, sources.items);
-    if (tableMenu) candidates.push(tableMenu);
+    if (tableMenu) {
+      candidates.push(tableMenu);
+      console.log(`   ↳ Cardápio das tabelas: ${tableMenu.length} categoria(s), ${menuItemCount(tableMenu)} prato(s)`);
+    } else if (sources.items.length) {
+      console.warn(`   ⚠️  menu_items retornou ${sources.items.length} registro(s), mas não foi possível montar o cardápio das tabelas.`);
+    }
 
     let mergedMenu = currentMenu;
     if (currentCount === 0 || currentIsDefault) {
@@ -895,19 +918,53 @@ async function migrateConfigImagesToStorage() {
       return;
     }
 
-    async function storageObjectExists(filename) {
-      try {
-        const u = new URL(storagePublicUrl(filename));
-        return await new Promise(resolve => {
-          const rr = https.request(u, { method: 'HEAD', headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` }, timeout: 8000 }, r => {
-            r.resume(); r.on('end', () => resolve(r.statusCode >= 200 && r.statusCode < 300));
+    // IMPORTANTE: não usamos HEAD para descobrir se um objeto existe. Em alguns ambientes/proxies
+    // o endpoint público pode responder de forma enganosa e fazer todas as 157 fotos parecerem
+    // "já existentes" mesmo quando o bucket está vazio. A lista oficial do Storage é a fonte de verdade.
+    async function listStorageObjects() {
+      const names = new Set();
+      let offset = 0;
+      const limit = 1000;
+      while (true) {
+        const bucket = SUPABASE_STORAGE_BUCKET.split('/').map(encodeURIComponent).join('/');
+        const u = new URL(`${SUPABASE_URL}/storage/v1/object/list/${bucket}`);
+        const body = JSON.stringify({ prefix: '', limit, offset, sortBy: { column: 'name', order: 'asc' } });
+        const rows = await new Promise((resolve, reject) => {
+          const req = https.request(u, {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${SUPABASE_KEY}`, 'apikey': SUPABASE_KEY, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+            timeout: 15000
+          }, res => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                try { resolve(JSON.parse(data || '[]')); } catch (e) { reject(new Error('Resposta inválida do Storage')); }
+              } else reject(new Error(`Storage list HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+            });
           });
-          rr.on('error', () => resolve(false));
-          rr.on('timeout', () => { rr.destroy(); resolve(false); });
-          rr.end();
+          req.on('error', reject);
+          req.on('timeout', () => { req.destroy(); reject(new Error('Storage list timeout')); });
+          req.write(body); req.end();
         });
-      } catch (e) { return false; }
+        const arr = Array.isArray(rows) ? rows : [];
+        for (const row of arr) if (row && row.name && !row.id) names.add(String(row.name));
+        if (arr.length < limit) break;
+        offset += limit;
+      }
+      return names;
     }
+
+    let storageNames = new Set();
+    try {
+      storageNames = await listStorageObjects();
+      console.log(`   ↳ Storage contém atualmente ${storageNames.size} objeto(s) no bucket ${SUPABASE_STORAGE_BUCKET}.`);
+    } catch (e) {
+      console.warn(`   ⚠️  Não consegui listar o bucket ${SUPABASE_STORAGE_BUCKET}: ${e.message}`);
+      // Se não conseguimos listar, NÃO vamos marcar nada como "já existente".
+      // Assim uma falha de listagem não esconde uma migração que precisa acontecer.
+    }
+
 
     const publicUrls = new Map();
     let migrated = 0, alreadyThere = 0, skipped = 0;
@@ -915,7 +972,7 @@ async function migrateConfigImagesToStorage() {
       const cleanName = path.basename(String(filename));
       if (!/^[A-Za-z0-9._-]+$/.test(cleanName)) { skipped++; continue; }
       const publicUrl = storagePublicUrl(cleanName);
-      if (await storageObjectExists(cleanName)) {
+      if (storageNames.has(cleanName)) {
         publicUrls.set(cleanName, publicUrl);
         publicUrls.set('upload_' + cleanName, publicUrl);
         alreadyThere++;
