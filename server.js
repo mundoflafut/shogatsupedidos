@@ -662,38 +662,71 @@ function normalizeLegacyTableMenu(categories, items) {
   return out.filter(c => c.items.length || categories.length === 1);
 }
 
+function newestTimestamp(rows) {
+  let best = 0;
+  for (const row of (rows || [])) {
+    for (const k of ['updated_at','updatedAt','created_at','createdAt','updated','created']) {
+      const t = Date.parse(String(row && row[k] || ''));
+      if (Number.isFinite(t) && t > best) best = t;
+    }
+  }
+  return best;
+}
+
+async function loadSupabaseMenuSources() {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return { legacy: null, categories: [], items: [] };
+  const out = { legacy: null, categories: [], items: [] };
+  for (const key of LEGACY_MENU_KEYS) {
+    try {
+      const value = await supabaseGetValueByKey(key);
+      const candidate = Array.isArray(value) ? value : (value && Array.isArray(value.menu) ? value.menu : null);
+      if (candidate && menuItemCount(candidate) > 0) { out.legacy = { key, menu: candidate }; break; }
+    } catch (e) {}
+  }
+  try { out.categories = await supabaseRequest('GET', 'menu_categories?select=*'); } catch (e) { console.warn('   ⚠️  Não consegui ler menu_categories:', e.message); }
+  try { out.items = await supabaseRequest('GET', 'menu_items?select=*'); } catch (e) { console.warn('   ⚠️  Não consegui ler menu_items:', e.message); }
+  return out;
+}
+
 async function restoreLegacyMenuIfNeeded() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return false;
   try {
     const raw = readJSON(CONFIG_FILE);
-    const rawMenu = raw && Array.isArray(raw.menu) ? raw.menu : null;
+    const currentMenu = raw && Array.isArray(raw.menu) ? raw.menu : [];
     const defaultMenuText = JSON.stringify(DEFAULT_MENU);
-    const rawMenuText = rawMenu ? JSON.stringify(rawMenu) : '';
-    const isDefault = rawMenuText && rawMenuText === defaultMenuText;
-    if (rawMenu && menuItemCount(rawMenu) > 0 && !isDefault) return false;
+    const currentIsDefault = JSON.stringify(currentMenu) === defaultMenuText;
+    const currentCount = menuItemCount(currentMenu);
+    const sources = await loadSupabaseMenuSources();
 
-    // Algumas versões antigas gravavam o cardápio em uma chave separada do config.
-    for (const key of LEGACY_MENU_KEYS) {
-      const value = await supabaseGetValueByKey(key);
-      const candidate = Array.isArray(value) ? value : (value && Array.isArray(value.menu) ? value.menu : null);
-      if (candidate && menuItemCount(candidate) > 0) {
-        const merged = { ...(raw || {}), menu: candidate };
-        writeJSON(CONFIG_FILE, merged);
-        console.log(`   ✓ Cardápio legado restaurado da chave Supabase "${key}": ${menuItemCount(candidate)} prato(s)`);
-        return true;
-      }
+    // 1) Chave legada separada tem prioridade quando o menu local é vazio/padrão.
+    if (sources.legacy && (currentCount === 0 || currentIsDefault)) {
+      const merged = { ...(raw || {}), menu: sources.legacy.menu };
+      writeJSON(CONFIG_FILE, merged);
+      console.log(`   ✓ Cardápio legado restaurado da chave Supabase "${sources.legacy.key}": ${menuItemCount(sources.legacy.menu)} prato(s)`);
+      return true;
     }
 
-    // Fallback para instalações antigas que já possuíam as tabelas de cardápio no Supabase.
-    let cats = [], items = [];
-    try { cats = await supabaseRequest('GET', 'menu_categories?select=*'); } catch (e) {}
-    try { items = await supabaseRequest('GET', 'menu_items?select=*'); } catch (e) {}
-    const candidate = normalizeLegacyTableMenu(cats, items);
-    if (candidate && menuItemCount(candidate) > 0) {
-      const merged = { ...(raw || {}), menu: candidate };
-      writeJSON(CONFIG_FILE, merged);
-      console.log(`   ✓ Cardápio legado restaurado das tabelas menu_categories/menu_items: ${menuItemCount(candidate)} prato(s)`);
-      return true;
+    // 2) As tabelas menu_categories/menu_items são a fonte de recuperação das versões antigas.
+    // Só substituímos o config quando elas têm mais dados, ou quando são comprovadamente mais
+    // recentes. Assim, uma edição nova feita pelo painel (que salva em shogatsu_kv/config) não
+    // é sobrescrita por uma tabela antiga.
+    const tableMenu = normalizeLegacyTableMenu(sources.categories, sources.items);
+    if (tableMenu && menuItemCount(tableMenu) > 0) {
+      const tableCount = menuItemCount(tableMenu);
+      let configUpdatedAt = 0;
+      try {
+        const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.config&select=updated_at`);
+        configUpdatedAt = newestTimestamp(rows);
+      } catch (e) {}
+      const tableUpdatedAt = Math.max(newestTimestamp(sources.categories), newestTimestamp(sources.items));
+      const shouldUseTables = currentCount === 0 || currentIsDefault || tableCount > currentCount || (tableUpdatedAt > 0 && tableUpdatedAt > configUpdatedAt);
+      if (shouldUseTables) {
+        const merged = { ...(raw || {}), menu: tableMenu };
+        writeJSON(CONFIG_FILE, merged);
+        console.log(`   ✓ Cardápio recuperado das tabelas menu_categories/menu_items: ${tableCount} prato(s)${tableUpdatedAt > configUpdatedAt && tableUpdatedAt ? ' — fonte mais recente' : ''}`);
+        return true;
+      }
+      console.log(`   ✓ Cardápio do config preservado: ${currentCount} prato(s); tabelas antigas têm ${tableCount}`);
     }
   } catch (e) {
     console.error('   ⚠️  Falha ao procurar cardápio legado:', e.message);
@@ -704,9 +737,12 @@ async function restoreLegacyMenuIfNeeded() {
 async function restoreFromSupabase() {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   console.log('☁️  Verificando backup no Supabase...');
-  await Promise.allSettled(Object.entries(FILE_TO_KEY).map(async ([file, key]) => {
+  // Restaura os arquivos de negócio primeiro. O config é restaurado antes da reconciliação do
+  // cardápio, para que nenhuma versão do ZIP (DEFAULT_MENU) ganhe prioridade por acidente.
+  const entries = Object.entries(FILE_TO_KEY);
+  for (const [file, key] of entries) {
     try {
-      const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${key}&select=value`);
+      const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${encodeURIComponent(key)}&select=value`);
       if (rows && rows[0] && rows[0].value !== undefined) {
         fs.writeFileSync(file, JSON.stringify(rows[0].value, null, 2));
         console.log(`   ✓ "${key}" restaurado do Supabase`);
@@ -714,7 +750,7 @@ async function restoreFromSupabase() {
     } catch (err) {
       console.error(`   ⚠️  Não consegui restaurar "${key}" do Supabase:`, err.message);
     }
-  }));
+  }
   await restoreLegacyMenuIfNeeded();
 }
 
@@ -807,8 +843,6 @@ async function migrateConfigImagesToStorage() {
   try {
     if (!fs.existsSync(CONFIG_FILE)) return;
     const cfg = readJSON(CONFIG_FILE);
-    // v139: no backup antigo, as fotos aparecem como registros upload_<arquivo> na shogatsu_kv.
-    // Não dependemos mais de a config conter exatamente /uploads/arquivo.jpg.
     const keyRows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=ilike.upload_*&select=key`);
     const names = new Set();
     for (const row of (keyRows || [])) {
@@ -816,13 +850,46 @@ async function migrateConfigImagesToStorage() {
       if (key.startsWith('upload_')) names.add(key.slice('upload_'.length));
     }
     for (const ref of collectLegacyUploadRefs(cfg)) names.add(ref);
+    // Fotos também podem estar referenciadas diretamente nas tabelas antigas.
+    try {
+      const rows = await supabaseRequest('GET', 'menu_items?select=*');
+      for (const item of (rows || [])) {
+        collectLegacyUploadRefs(item.image || item.photo || item.foto || item.image_url || item.photo_url || item.foto_url, names);
+      }
+    } catch (e) {}
     if (!names.size) return;
 
+    async function storageObjectExists(filename) {
+      try {
+        const u = new URL(storagePublicUrl(filename));
+        return await new Promise(resolve => {
+          const rr = https.request(u, {
+            method: 'HEAD',
+            headers: { 'apikey': SUPABASE_KEY, 'Authorization': `Bearer ${SUPABASE_KEY}` },
+            timeout: 8000
+          }, r => { r.resume(); r.on('end', () => resolve(r.statusCode >= 200 && r.statusCode < 300)); });
+          rr.on('error', () => resolve(false));
+          rr.on('timeout', () => { rr.destroy(); resolve(false); });
+          rr.end();
+        });
+      } catch (e) { return false; }
+    }
+
     const publicUrls = new Map();
-    let migrated = 0, skipped = 0;
+    let migrated = 0, alreadyThere = 0, skipped = 0;
     for (const filename of names) {
       const cleanName = path.basename(filename);
       if (!/^[A-Za-z0-9._-]+$/.test(cleanName)) continue;
+      const publicUrl = storagePublicUrl(cleanName);
+
+      // Primeiro verifica o Storage. Se já estiver lá, NÃO baixa o Base64 antigo do banco.
+      if (await storageObjectExists(cleanName)) {
+        publicUrls.set(cleanName, publicUrl);
+        publicUrls.set('upload_' + cleanName, publicUrl);
+        alreadyThere++;
+        continue;
+      }
+
       const filePath = path.join(UPLOADS_DIR, cleanName);
       let buffer = null;
       if (fs.existsSync(filePath)) {
@@ -841,7 +908,7 @@ async function migrateConfigImagesToStorage() {
       const mime = { '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.png':'image/png', '.webp':'image/webp', '.gif':'image/gif' }[ext];
       if (!mime) { skipped++; continue; }
       try {
-        const publicUrl = await supabaseStorageUpload(cleanName, buffer, mime);
+        await supabaseStorageUpload(cleanName, buffer, mime);
         publicUrls.set(cleanName, publicUrl);
         publicUrls.set('upload_' + cleanName, publicUrl);
         migrated++;
@@ -851,10 +918,13 @@ async function migrateConfigImagesToStorage() {
     }
     if (publicUrls.size) {
       const updatedCfg = replaceLegacyUploadRefs(cfg, publicUrls);
-      writeJSON(CONFIG_FILE, updatedCfg);
-      console.log(`   ✓ Referências das fotos atualizadas no cardápio: ${publicUrls.size}`);
+      // Só grava se realmente houve alteração; isso evita criar uma nova sincronização de config.
+      const before = JSON.stringify(cfg);
+      const after = JSON.stringify(updatedCfg);
+      if (before !== after) writeJSON(CONFIG_FILE, updatedCfg);
+      console.log(`   ✓ Referências de fotos verificadas: ${publicUrls.size / 2} arquivo(s) no Storage`);
     }
-    console.log(`   ✓ Migração Storage: ${migrated} foto(s) → ${SUPABASE_STORAGE_BUCKET}${skipped ? `; ${skipped} não disponíveis` : ''}`);
+    console.log(`   ✓ Storage de fotos: ${migrated} migrada(s), ${alreadyThere} já existente(s)${skipped ? `, ${skipped} indisponível(is)` : ''}`);
   } catch (err) {
     console.error('   ⚠️  Não consegui migrar fotos para o Supabase Storage:', err.message);
   }
@@ -6687,17 +6757,11 @@ server.listen(PORT, () => {
 });
 restoreFromSupabase().then(async () => {
   loadSessionsFromDisk(); // v60: depois de restaurar do Supabase (se configurado), carrega sessões válidas pra memória
-  // v137/v138: migra fotos legadas somente quando o config restaurado ainda contém /uploads/.
-  // Depois da migração bem-sucedida, o próprio config salvo no Supabase passa a apontar para
-  // Storage e os próximos deploys deixam de baixar as fotos Base64 antigas.
-  let precisaMigrarFotos = false;
-  try {
-    if (fs.existsSync(CONFIG_FILE)) precisaMigrarFotos = collectLegacyUploadRefs(readJSON(CONFIG_FILE)).size > 0;
-  } catch (e) {}
-  // v140: migração definitiva para Storage. Não restaura mais todas as fotos Base64 para
-  // uploads/ antes de migrá-las — isso duplicava o tráfego. A migração busca cada foto antiga
-  // somente quando necessário, envia uma vez ao Storage e troca as referências do cardápio.
-  if (precisaMigrarFotos) await migrateConfigImagesToStorage();
+  // v141: verifica a migração de fotos em TODO boot, mas sem baixar Base64 quando o objeto
+  // já existe no Storage. Isso também encontra referências que ficaram apenas em menu_items.
+  // O custo recorrente é somente uma consulta de nomes + HEADs leves; o conteúdo pesado só é
+  // baixado uma vez, quando a foto realmente ainda não existe no Storage.
+  await migrateConfigImagesToStorage();
   // Diagnóstico explícito para confirmar que o cardápio real (e não o DEFAULT_MENU) foi restaurado.
   try {
     const restored = readConfig();
