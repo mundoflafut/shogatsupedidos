@@ -1,3 +1,85 @@
+# v136 — Redução de Egress do Supabase
+
+Auditoria feita a partir de um alerta de "Organization exceeded quota — Egress Exceeded" do Supabase. Importante: este projeto **não usa Supabase Realtime, channels, subscriptions nem RLS multi-tenant** — o Supabase aqui funciona só como backup de chave-valor (um arquivo local = uma chave), e a sincronização ao vivo entre painel/Kanban/cliente é feita por Server-Sent Events do próprio servidor Node, não pelo Supabase. A auditoria focou no que realmente existe nesta arquitetura.
+
+### Antes
+```
+Problema: toda mudança (1 pedido, 1 login, 1 linha de log) reenviava o ARQUIVO INTEIRO
+          daquela chave pro Supabase, na hora, sem agrupar mudanças próximas.
+Arquivo:  server.js
+Função:   syncToSupabase()
+Causa:    num horário de pico com vários pedidos mudando de status em sequência rápida,
+          orders.json inteiro (que só cresce) podia ser reenviado várias vezes por minuto —
+          o mesmo pra sessions.json a cada login.
+```
+```
+Problema: sessions.json acumulava sessões válidas sem limite (um deploy chegou a restaurar
+          3428 sessões de uma vez).
+Arquivo:  server.js
+Função:   persistSessions()
+Causa:    nenhum teto de quantidade — só filtrava sessões expiradas, não limitava o total.
+```
+
+### Correção
+```
+Arquivo:  server.js
+Alteração: syncToSupabase() agora espera 3 segundos coletando a versão mais recente da
+           mesma chave antes de enviar — várias mudanças seguidas viram UM envio só, com o
+           estado mais atual (nenhuma mudança é perdida, só evita mandar cópias repetidas e
+           cada vez maiores em sequência). Adicionado flushPendingSupabaseSyncs(), acionado
+           em SIGTERM/SIGINT (sinal que o Render manda antes de derrubar o container num
+           redeploy), pra nunca perder a última mudança pendente num redeploy normal.
+Motivo:    reduzir reenvios repetidos do mesmo arquivo crescente em sequência rápida.
+Impacto esperado no Egress: redução direta e proporcional à frequência de mudanças por
+           minuto em cada arquivo — nos horários de pico (vários pedidos por minuto) é onde
+           mais reduz.
+```
+```
+Arquivo:  server.js
+Alteração: persistSessions() agora mantém no máximo 500 sessões válidas simultâneas
+           (as mais recentes) — descarta as mais antigas além desse teto, tanto do arquivo
+           quanto da memória. 500 logins válidos ao mesmo tempo é uma quantidade generosa
+           pra qualquer operação de um restaurante; se uma sessão for descartada por estar
+           entre as mais antigas além do limite, o pior efeito é pedir login de novo — nunca
+           trava nada.
+Motivo:    sessions.json crescendo sem limite = mais bytes reenviados e restaurados a cada
+           mudança/reinício, sem nenhum benefício (sessões muito antigas raramente importam).
+Impacto esperado no Egress: reduz o tamanho de sessions.json de forma permanente,
+           independente de quantos logins aconteçam ao longo do tempo.
+```
+
+### Verificado e já estava correto (sem necessidade de mudança)
+- `print-log.json`, `delete-log.json` e `permission-log.json` já tinham retenção (500/500/1000 entradas mais recentes) e nem passam pelo backup do Supabase (não estão na lista de arquivos sincronizados).
+- Escritas ao Supabase (POST) já usam `Prefer: return=minimal` — a resposta não ecoa de volta o conteúdo enviado (evita dobrar o tráfego de cada envio).
+- Dedup por conteúdo idêntico (v107) já existia e continua funcionando dentro da nova janela de espera.
+- Restauração de fotos (v134) só baixa fotos que realmente estão faltando localmente, nunca as que já existem.
+- Não existe nenhum `setInterval`/polling que consulte o Supabase periodicamente — a única leitura acontece uma vez, na inicialização do servidor.
+- Pedidos, clientes, produtos e histórico comercial: nada foi apagado, resumido ou alterado.
+
+### Checklist
+```
+[x] Realtime duplicado corrigido — N/A, este projeto não usa Realtime do Supabase
+[x] Polling desnecessário removido — não existia nenhum
+[ ] Selects otimizados — N/A, este projeto não faz queries SQL/`select()` no Supabase (é REST de chave-valor)
+[x] Kanban incremental — N/A, o Kanban já sincroniza via SSE do próprio servidor, nunca consultou o Supabase diretamente
+[x] Cache implementado — dedup por conteúdo idêntico já existia (v107); mantido
+[x] Imagens otimizadas — só baixa as que faltam (já era assim desde a v134)
+[x] /api/config otimizado — não é servido pelo Supabase, é lido do disco local a cada chamada (sem custo de Egress do Supabase)
+[x] Logs controlados — já tinham retenção; confirmado que não sincronizam com o Supabase
+[x] error_logs verificado — não existe essa tabela/arquivo neste projeto
+[x] realtime_events verificado — não existe; projeto não usa Realtime
+[x] impressão preservada — nenhuma linha do sistema de impressão foi tocada
+[x] reconexão controlada — Agente Local já reconecta com backoff crescente (até 60s) e reaproveita o token de login (já existia)
+[x] isolamento por restaurante — N/A, este deploy é de um restaurante só (não é multi-tenant)
+[x] RLS preservado — N/A, este projeto não usa tabelas com RLS (chave-valor simples)
+```
+
+# v135 — Upload de foto reforçado (clique sem resposta)
+
+- **Reforçado — "clique não faz nada" ao tentar trocar a foto do prato**: testei o código isolado (simulação de clique real) e tudo funcionou normalmente, então não achei um bug de lógica reproduzível — mas como não é a primeira vez que um clique "não faz nada" foi relatado, troquei o gatilho de abrir o seletor de arquivo (tanto na foto grande quanto no botão "📷 Escolher foto" do editor completo) de um `onclick` em JavaScript para um `<label>` nativo do HTML associado ao campo de arquivo. Essa troca é mais robusta: abre o seletor de arquivo por mecanismo do próprio navegador, funcionando mesmo que algum erro de JavaScript em outro lugar da página quebre o `onclick`.
+- Também adicionado um aviso visível (em vez de falha silenciosa) se a troca rápida de foto pelo card do cardápio (📷 Trocar foto) não conseguir abrir o seletor de arquivo por qualquer motivo.
+- **Se o problema persistir depois dessa atualização**: por favor abra o DevTools do navegador (F12 → aba Console) bem na hora de clicar e me diga se aparece alguma mensagem em vermelho — isso ajuda a identificar a causa exata no seu ambiente específico.
+
 # v134 — Corrigido 503 logo após o deploy
 
 - **Bug corrigido — site fora do ar (HTTP 503) logo depois de cada deploy/"acordar"**: o servidor só começava a aceitar conexões DEPOIS de terminar de restaurar tudo do Supabase (pedidos, config, sessões e — o mais demorado — as fotos do cardápio, uma por uma em sequência). Com muitas fotos cadastradas, essa restauração podia levar bem mais de um minuto, e o Render devolvia 503 ("No open ports detected...") pra qualquer pessoa tentando abrir o site nesse meio-tempo, mesmo o servidor subindo com sucesso logo depois.
