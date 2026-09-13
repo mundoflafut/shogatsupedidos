@@ -503,6 +503,11 @@ const SUPABASE_TABLE = process.env.SUPABASE_TABLE || 'shogatsu_kv';
 // O bucket já existente no projeto pode ser informado no Render; por padrão usamos o nome
 // criado para o cardápio. Não use a service_role no navegador: ela fica somente no servidor.
 const SUPABASE_STORAGE_BUCKET = 'BANCO DE FOTS';
+// v138 — o cardápio público não pode receber o menu padrão do ZIP enquanto o backup
+// real do restaurante ainda está sendo restaurado do Supabase. Sem esta trava, um visitante
+// que abrisse a página no primeiro segundo após o deploy podia ver um cardápio menor/antigo.
+let SUPABASE_RESTORE_READY = !SUPABASE_URL || !SUPABASE_KEY;
+let SUPABASE_RESTORE_ERROR = '';
 const FILE_TO_KEY = { [ORDERS_FILE]: 'orders', [CONFIG_FILE]: 'config', [CUSTOMERS_FILE]: 'customers', [RESERVATIONS_FILE]: 'reservations', [PUSH_SUBS_FILE]: 'push_subs', [ADMIN_PUSH_SUBS_FILE]: 'admin_push_subs', [SCHEDULED_PUSH_FILE]: 'scheduled_push', [COURIERS_FILE]: 'couriers', [DELETE_LOG_FILE]: 'delete_log', [PERMISSION_LOG_FILE]: 'permission_log', [INGREDIENTES_FILE]: 'ingredientes', [FICHAS_TECNICAS_FILE]: 'fichas_tecnicas', [CUSTOS_CONFIG_FILE]: 'custos_config', [SESSIONS_FILE]: 'sessions', [APROVACOES_IA_FILE]: 'aprovacoes_ia' };
 
 function supabaseRequest(method, subpath, body) {
@@ -677,6 +682,8 @@ function collectLegacyUploadRefs(value, out = new Set()) {
   if (typeof value === 'string') {
     const m = value.match(/(?:^|\/)uploads\/([^?#'"\s]+)/i);
     if (m && m[1]) out.add(decodeURIComponent(m[1]));
+    const bare = value.trim().match(/^(upload_[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp|gif))$/i);
+    if (bare) out.add(bare[1]);
   } else if (Array.isArray(value)) {
     value.forEach(v => collectLegacyUploadRefs(v, out));
   } else if (value && typeof value === 'object') {
@@ -687,10 +694,13 @@ function collectLegacyUploadRefs(value, out = new Set()) {
 
 function replaceLegacyUploadRefs(value, publicUrls) {
   if (typeof value === 'string') {
-    return value.replace(/(^|\/)uploads\/([^?#'"\s]+)/ig, (all, prefix, filename) => {
+    let out = value.replace(/(^|\/)uploads\/([^?#'"\s]+)/ig, (all, prefix, filename) => {
       const clean = decodeURIComponent(filename);
       return publicUrls.get(clean) || all;
     });
+    const bare = out.trim();
+    if (publicUrls.has(bare)) return publicUrls.get(bare);
+    return out;
   }
   if (Array.isArray(value)) return value.map(v => replaceLegacyUploadRefs(v, publicUrls));
   if (value && typeof value === 'object') {
@@ -707,30 +717,55 @@ async function migrateConfigImagesToStorage() {
   try {
     if (!fs.existsSync(CONFIG_FILE)) return;
     const cfg = readJSON(CONFIG_FILE);
-    const refs = [...collectLegacyUploadRefs(cfg)];
-    if (!refs.length) return;
-    const publicUrls = new Map();
-    let migrated = 0;
-    for (const filename of refs) {
-      const filePath = path.join(UPLOADS_DIR, path.basename(filename));
-      if (!fs.existsSync(filePath)) {
-        console.warn(`   ⚠️  Foto antiga não encontrada localmente: ${filename}`);
-        continue;
-      }
-      const ext = path.extname(filename).toLowerCase();
-      const mime = { '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.png':'image/png', '.webp':'image/webp', '.gif':'image/gif' }[ext] || 'application/octet-stream';
-      const publicUrl = await supabaseStorageUpload(path.basename(filename), fs.readFileSync(filePath), mime);
-      publicUrls.set(filename, publicUrl);
-      migrated++;
+    // v139: no backup antigo, as fotos aparecem como registros upload_<arquivo> na shogatsu_kv.
+    // Não dependemos mais de a config conter exatamente /uploads/arquivo.jpg.
+    const keyRows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=ilike.upload_*&select=key`);
+    const names = new Set();
+    for (const row of (keyRows || [])) {
+      const key = String(row.key || '');
+      if (key.startsWith('upload_')) names.add(key.slice('upload_'.length));
     }
-    if (!publicUrls.size) return;
-    const updated = replaceLegacyUploadRefs(cfg, publicUrls);
-    writeJSON(CONFIG_FILE, updated);
-    console.log(`   ✓ ${migrated} foto(s) do cardápio migrada(s) para Supabase Storage → ${SUPABASE_STORAGE_BUCKET}`);
+    for (const ref of collectLegacyUploadRefs(cfg)) names.add(ref);
+    if (!names.size) return;
+
+    const publicUrls = new Map();
+    let migrated = 0, skipped = 0;
+    for (const filename of names) {
+      const cleanName = path.basename(filename);
+      if (!/^[A-Za-z0-9._-]+$/.test(cleanName)) continue;
+      const filePath = path.join(UPLOADS_DIR, cleanName);
+      let buffer = null;
+      if (fs.existsSync(filePath)) {
+        buffer = fs.readFileSync(filePath);
+      } else {
+        try {
+          const rows = await supabaseRequest('GET', `${SUPABASE_TABLE}?key=eq.${encodeURIComponent('upload_' + cleanName)}&select=value`);
+          const row = rows && rows[0];
+          if (row && row.value && row.value.b64) buffer = Buffer.from(row.value.b64, 'base64');
+        } catch (e) {
+          console.warn(`   ⚠️  Não consegui recuperar a foto antiga ${cleanName}: ${e.message}`);
+        }
+      }
+      if (!buffer || !buffer.length) { skipped++; continue; }
+      const ext = path.extname(cleanName).toLowerCase();
+      const mime = { '.jpg':'image/jpeg', '.jpeg':'image/jpeg', '.png':'image/png', '.webp':'image/webp', '.gif':'image/gif' }[ext];
+      if (!mime) { skipped++; continue; }
+      try {
+        const publicUrl = await supabaseStorageUpload(cleanName, buffer, mime);
+        publicUrls.set(cleanName, publicUrl);
+        publicUrls.set('upload_' + cleanName, publicUrl);
+        migrated++;
+      } catch (e) {
+        console.warn(`   ⚠️  Não consegui enviar ${cleanName} ao Storage: ${e.message}`);
+      }
+    }
+    if (publicUrls.size) writeJSON(CONFIG_FILE, replaceLegacyUploadRefs(cfg, publicUrls));
+    console.log(`   ✓ Migração Storage: ${migrated} foto(s) → ${SUPABASE_STORAGE_BUCKET}${skipped ? `; ${skipped} não disponíveis` : ''}`);
   } catch (err) {
     console.error('   ⚠️  Não consegui migrar fotos para o Supabase Storage:', err.message);
   }
 }
+
 // v107 — REDUÇÃO DE BANDWIDTH (causa raiz do consumo alto de "Service-Initiated"): antes, essa
 // função baixava o CONTEÚDO (base64) de TODAS as fotos já enviadas de uma vez só — mesmo das que
 // já existiam certinho em UPLOADS_DIR — e ela roda em TODO restart do processo (todo deploy, todo
@@ -2361,7 +2396,10 @@ function sendJSON(res, status, obj) {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,PATCH,OPTIONS'
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,OPTIONS',
+    'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+    'Pragma': 'no-cache',
+    'Expires': '0'
   });
   res.end(body);
 }
@@ -2501,6 +2539,11 @@ async function handleRequest(req, res) {
 
   // ── GET /api/config — dados públicos do cardápio/config ──
   if (pathname === '/api/config' && req.method === 'GET') {
+    // v138: quando há Supabase configurado, espera a restauração terminar antes de
+    // entregar o menu. Isso impede que o DEFAULT_MENU do ZIP apareça temporariamente.
+    if (!SUPABASE_RESTORE_READY) {
+      return sendJSON(res, 503, { error: 'O cardápio está sendo restaurado. Tente novamente em alguns segundos.', restoring: true });
+    }
     const { cfg, menu } = readConfig();
     const { adminPass, masterPass, ...publicCfg } = cfg; // nunca vaza as senhas
     // v56: a chave de API da IA também não pode vazar pro público (o cardápio é servido pra
@@ -6548,11 +6591,11 @@ server.listen(PORT, () => {
     console.log('⚠️  ATENÇÃO: UPLOADS_DIR não configurado e Supabase não configurado — fotos enviadas podem se perder no próximo deploy. Configure um Disco Persistente (UPLOADS_DIR) ou SUPABASE_URL/SUPABASE_SERVICE_KEY. Veja o README.md.');
   }
 });
-restoreFromSupabase().finally(async () => {
+restoreFromSupabase().then(async () => {
   loadSessionsFromDisk(); // v60: depois de restaurar do Supabase (se configurado), carrega sessões válidas pra memória
-  // v137: só usa o antigo backup Base64 de fotos se ainda existirem referências /uploads/ no
-  // config. Depois da primeira migração para Storage, os próximos deploys não precisam mais
-  // baixar as 157+ fotos do banco, reduzindo fortemente o Egress.
+  // v137/v138: migra fotos legadas somente quando o config restaurado ainda contém /uploads/.
+  // Depois da migração bem-sucedida, o próprio config salvo no Supabase passa a apontar para
+  // Storage e os próximos deploys deixam de baixar as fotos Base64 antigas.
   let precisaMigrarFotos = false;
   try {
     if (fs.existsSync(CONFIG_FILE)) precisaMigrarFotos = collectLegacyUploadRefs(readJSON(CONFIG_FILE)).size > 0;
@@ -6561,4 +6604,21 @@ restoreFromSupabase().finally(async () => {
     await restoreUploadsFromSupabase();
     await migrateConfigImagesToStorage();
   }
+  // Diagnóstico explícito para confirmar que o cardápio real (e não o DEFAULT_MENU) foi restaurado.
+  try {
+    const restored = readConfig();
+    const cats = Array.isArray(restored.menu) ? restored.menu.length : 0;
+    const pratos = Array.isArray(restored.menu) ? restored.menu.reduce((n, c) => n + (Array.isArray(c.items) ? c.items.length : 0), 0) : 0;
+    console.log(`   ✓ Cardápio restaurado do Supabase: ${cats} categoria(s), ${pratos} prato(s)`);
+  } catch (e) {
+    console.error('   ⚠️  Não consegui validar o cardápio restaurado:', e.message);
+  }
+  SUPABASE_RESTORE_READY = true;
+}).catch(err => {
+  SUPABASE_RESTORE_ERROR = err && err.message ? err.message : 'falha na restauração';
+  // restoreFromSupabase usa Promise.allSettled e normalmente não rejeita, mas mantemos esta
+  // proteção para nunca deixar /api/config bloqueado indefinidamente.
+  loadSessionsFromDisk();
+  SUPABASE_RESTORE_READY = true;
+  console.error('   ⚠️  Restauração geral do Supabase terminou com erro:', SUPABASE_RESTORE_ERROR);
 });

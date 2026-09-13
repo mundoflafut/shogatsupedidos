@@ -154,3 +154,10 @@ Impacto esperado no Egress: reduz o tamanho de sessions.json de forma permanente
 - Aviso Sonoro do Cliente unificado visualmente com Alertas de pedidos, preservando IDs e funções existentes.
 - Funcionamento por dia convertido para grade compacta e responsiva.
 - Não foram alteradas APIs, banco ou páginas do cliente além do estilo/posição do badge no cardápio.
+
+
+## v139 — restauração segura do cardápio e fotos
+- O endpoint público `/api/config` aguarda a restauração do backup real do restaurante antes de entregar o menu.
+- O cliente tenta novamente durante a restauração, evitando mostrar o `DEFAULT_MENU` do ZIP.
+- O servidor registra a quantidade de categorias e pratos efetivamente restaurados.
+- O bucket de fotos continua fixo em `BANCO DE FOTS`; nenhuma variável `SUPABASE_STORAGE_BUCKET` é necessária.
